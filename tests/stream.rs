@@ -1,7 +1,7 @@
 //! Stream FEC integration tests: loopback encode → audio → decode.
 //!
-//! Tests the streaming codec which uses RS(7,k) over GF(2^3) where each
-//! 3-bit symbol maps directly to the 8-symbol modem alphabet.
+//! Tests the streaming codec which uses RS(15,k) over GF(2^4) where each
+//! GF(16) symbol maps to two 2-bit vowel symbols of the 4-vowel modem.
 
 use song_rs::{StreamTx, StreamRx, StreamConfig};
 use song_rs::rs4::ReedSolomon4;
@@ -259,8 +259,8 @@ fn phone_channel(samples: &[f32]) -> Vec<f32> {
 
 // --- Stream loopback tests ---
 //
-// These tests use the RS(7,k) streaming codec which outputs 3-bit symbols (0-7)
-// compatible with the Teams 8-symbol modem alphabet.
+// These tests use the RS(15,k) GF(2^4) streaming codec: each GF(16) symbol
+// maps to exactly two 2-bit vowel symbols of the 4-vowel modem alphabet.
 
 #[test]
 fn test_stream_clean() {
@@ -331,11 +331,11 @@ fn test_stream_phone() {
 #[test]
 #[cfg_attr(feature = "8khz", ignore)] // Uses 48kHz-specific symbol timing
 fn test_stream_burst_erasure() {
-    // With block interleaving (depth=2), a burst of 2 consecutive bad symbols
-    // in the interleaved stream is spread across 2 codewords (1 error each),
-    // within RS(7,5) correction capacity of 1 error per codeword.
+    // With block interleaving (depth=2), a burst of zeroed symbol slots
+    // becomes zero-confidence erasures spread across codewords, within
+    // RS(15,11) correction capacity (4 parity: 2 errors or 4 erasures).
     let data: Vec<u8> = (0..50).map(|i| (i * 7 + 13) as u8).collect();
-    let config = StreamConfig::default(); // depth=2, RS(7,5)
+    let config = StreamConfig::default(); // depth=2, RS(15,11)
 
     let result = stream_loopback(&data, |audio| {
         let mut processed = audio.to_vec();
@@ -448,4 +448,48 @@ fn test_stream_no_symbol_overflow_panic() {
         let result = receive_audio(&audio, config);
         assert_eq!(result.as_slice(), *pattern, "roundtrip failed for pattern {:?}", pattern);
     }
+}
+
+// ── Streaming codec stress: sync fragility ───────────────────────────
+
+/// Corrupt one symbol slot's audio by replacing it with a different vowel's
+/// synthesis (confident wrong symbol — the harshest corruption).
+fn swap_symbol_window(audio: &mut [f32], slot: usize) {
+    use song_rs::formant;
+    use song_rs::protocol::*;
+    let start = slot * SYMBOL_TOTAL_SAMPLES;
+    if start + SYMBOL_TOTAL_SAMPLES > audio.len() {
+        return;
+    }
+    let synth = formant::synthesize_symbol(2, melody_f0(slot), 0.5, slot);
+    for (i, &s) in synth.iter().enumerate() {
+        audio[start + i] = s as f32;
+    }
+}
+
+#[test]
+fn test_stream_preamble_symbol_corrupted() {
+    // One corrupted preamble symbol must not cost the whole stream.
+    let data: Vec<u8> = (0..40u8).collect();
+    let cfg = StreamConfig::default();
+    let mut audio = generate_audio(&data, cfg.clone());
+    // Slot 1 is preamble symbol [3] — swap it for vowel 2.
+    swap_symbol_window(&mut audio, 1);
+    let received = receive_audio(&audio, cfg);
+    assert_eq!(received, data, "stream lost to one corrupted preamble symbol");
+}
+
+#[test]
+fn test_stream_dropped_20ms() {
+    // Jitter buffer removes 20 ms mid-stream: a symbol slip. The receiver
+    // must resynchronize rather than scramble everything downstream.
+    let data: Vec<u8> = (0..40u8).collect();
+    let cfg = StreamConfig::default();
+    let audio = generate_audio(&data, cfg.clone());
+    let drop = (song_rs::protocol::SAMPLE_RATE * 0.02) as usize; // 20 ms
+    let mid = audio.len() / 2;
+    let mut cut = audio[..mid].to_vec();
+    cut.extend_from_slice(&audio[mid + drop..]);
+    let received = receive_audio(&cut, cfg);
+    assert_eq!(received, data, "stream broken by 20 ms drop");
 }

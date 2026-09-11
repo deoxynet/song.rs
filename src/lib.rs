@@ -1,8 +1,10 @@
-//! 2-channel orthogonal vocal modem — encode data as vowel-like audio.
+//! Vowel-formant modem — encode data as vowel-like audio with melodic pitch.
 //!
-//! Encode byte payloads to 48 kHz f32 audio using two orthogonal channels
-//! (formant vowels, dual-F0 pitch) and decode f32 audio back to bytes.
-//! Teams branch: 4 vowels × 2 pitches = 8 symbols (3 bits per symbol).
+//! Encode byte payloads to 48 kHz f32 audio using vowel identity (F2 formant)
+//! as the sole data channel and decode f32 audio back to bytes.
+//! Teams branch: 4 vowels = 2 bits per symbol. Pitch carries no data — the
+//! encoder plays a D lydian arpeggio (protocol::MELODY) and detection is
+//! F0-agnostic, so pitch distortion can never corrupt data.
 //!
 //! # Example
 //!
@@ -24,8 +26,10 @@ pub mod encoder;
 pub mod decoder;
 pub mod phy;
 pub mod stream;
+pub mod transfer;
 
 pub use decoder::Decoder;
+pub use encoder::encode_with_pitch;
 pub use phy::{Phy, PhyConfig, PhyEvent, PhyError};
 pub use stream::{StreamTx, StreamRx, StreamConfig};
 
@@ -35,8 +39,18 @@ pub use stream::{StreamTx, StreamRx, StreamConfig};
 /// `volume`: output volume, 0..=100 (typically 10-50).
 ///
 /// Returns a `Vec<f32>` of audio samples at 48 kHz.
+///
+/// The payload sings the default melody — the head of Giant Steps
+/// (pitch carries no data). For maximum channel margin on worst-case
+/// links, use [`encode_armored`].
 pub fn encode(payload: &[u8], volume: u8) -> Result<Vec<f32>, Error> {
     encoder::encode(payload, volume)
+}
+
+/// Encode with the margin-verified arpeggio melody throughout — maximum
+/// channel robustness (the default for the secret-transfer profile).
+pub fn encode_armored(payload: &[u8], volume: u8) -> Result<Vec<f32>, Error> {
+    encoder::encode_armored(payload, volume)
 }
 
 /// Errors returned by encode/decode operations.
@@ -53,6 +67,9 @@ pub enum Error {
 
     #[error("decode failed: could not extract valid payload from audio")]
     DecodeFailed,
+
+    #[error("pitch track length {got} does not match payload length {expected}")]
+    PitchTrackMismatch { got: usize, expected: usize },
 }
 
 #[cfg(test)]
@@ -117,8 +134,10 @@ mod tests {
         let n_ecc = protocol::ecc_bytes_for_length(data_length);
         let total_bytes = protocol::ENCODED_DATA_OFFSET + data_length + n_ecc;
         let n_data_symbols = formant::symbols_for_bytes(total_bytes);
-        let total_symbols =
-            protocol::PREAMBLE_LEN + n_data_symbols + protocol::PREAMBLE_LEN;
+        let total_symbols = protocol::PREAMBLE_LEN
+            + protocol::PILOT_LEN
+            + n_data_symbols
+            + protocol::PREAMBLE_LEN;
         let expected_samples = total_symbols * protocol::SYMBOL_TOTAL_SAMPLES;
 
         assert_eq!(
@@ -240,6 +259,31 @@ mod tests {
         decoder.reset();
         let result = decoder.decode(&audio).unwrap();
         assert_eq!(result.as_deref(), Some(&payload[..]));
+    }
+
+    // --- Expressive pitch API ---
+
+    #[test]
+    fn test_encode_with_pitch_roundtrip() {
+        let payload = b"pitch track test";
+        let track: Vec<f64> = payload
+            .iter()
+            .enumerate()
+            .map(|(i, _)| protocol::F0_CANDIDATES[i % protocol::F0_CANDIDATES.len()])
+            .collect();
+        let audio = encode_with_pitch(payload, 50, Some(&track)).unwrap();
+        let mut decoder = Decoder::new();
+        let result = decoder.decode(&audio).unwrap();
+        assert_eq!(result.as_deref(), Some(&payload[..]));
+    }
+
+    #[test]
+    fn test_encode_with_pitch_length_mismatch() {
+        let track = vec![146.83f64; 3];
+        assert!(matches!(
+            encode_with_pitch(b"hello", 50, Some(&track)),
+            Err(Error::PitchTrackMismatch { .. })
+        ));
     }
 
     // --- Volume 0 produces silent output ---
@@ -520,30 +564,33 @@ mod tests {
         assert_eq!(result.as_deref(), Some(&payload[..]));
     }
 
-    // --- 16-symbol classification test ---
+    // --- Symbol classification across the whole melody ---
 
     #[test]
-    fn test_all_16_symbols_classify() {
+    fn test_all_symbols_classify_at_all_melody_notes() {
         let mut failures = Vec::new();
-        for sym in 0..protocol::NUM_SYMBOLS {
-            let voiced_f64 = formant::synthesize_symbol(sym, 0.5);
-            let voiced: Vec<f32> = voiced_f64.iter().map(|&s| s as f32).collect();
-            let mut spectrum = vec![0.0f32; voiced.len()];
-            fft::power_spectrum(&voiced, &mut spectrum);
-            let (detected, _conf) = formant::classify_symbol(&spectrum);
-            if detected != sym {
-                failures.push((sym, detected));
+        for pos in 0..protocol::MELODY.len() {
+            let f0 = protocol::melody_f0(pos);
+            for sym in 0..protocol::NUM_SYMBOLS {
+                let slot = formant::synthesize_symbol(sym, f0, 0.5, pos);
+                let voiced: Vec<f32> = slot[..protocol::SAMPLES_PER_SYMBOL]
+                    .iter()
+                    .map(|&s| s as f32)
+                    .collect();
+                let mut spectrum = vec![0.0f32; voiced.len()];
+                fft::power_spectrum(&voiced, &mut spectrum);
+                let (detected, _conf) =
+                    formant::classify_symbol(&spectrum, &formant::EXPECTED_F2_CENTROIDS);
+                if detected != sym {
+                    failures.push((f0, sym, detected));
+                }
             }
         }
         if !failures.is_empty() {
-            for (expected, got) in &failures {
-                let (ev, evc) = formant::symbol_to_params(*expected);
-                let (gv, gvc) = formant::symbol_to_params(*got);
-                eprintln!(
-                    "FAIL symbol {expected} (v={ev},p={evc:?}) → {got} (v={gv},p={gvc:?})"
-                );
+            for (f0, expected, got) in &failures {
+                eprintln!("FAIL vowel {expected} at F0={f0} → {got}");
             }
-            panic!("{} of 16 symbols misclassified", failures.len());
+            panic!("{} (note, vowel) pairs misclassified", failures.len());
         }
     }
 
@@ -558,8 +605,10 @@ mod tests {
             let n_ecc = protocol::ecc_bytes_for_length(size);
             let total_bytes = protocol::ENCODED_DATA_OFFSET + size + n_ecc;
             let n_data_symbols = formant::symbols_for_bytes(total_bytes);
-            let total_symbols =
-                protocol::PREAMBLE_LEN + n_data_symbols + protocol::PREAMBLE_LEN;
+            let total_symbols = protocol::PREAMBLE_LEN
+                + protocol::PILOT_LEN
+                + n_data_symbols
+                + protocol::PREAMBLE_LEN;
             let expected = total_symbols * protocol::SYMBOL_TOTAL_SAMPLES;
 
             assert_eq!(

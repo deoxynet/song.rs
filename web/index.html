@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#f3f2f2">
+<meta name="color-scheme" content="light">
+<title>AKT — acoustic key transfer</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23f3f2f2'/%3E%3Crect x='2' y='9' width='2' height='5' fill='%23201e1d'/%3E%3Crect x='5' y='5' width='2' height='9' fill='%23ec3013'/%3E%3Crect x='8' y='2' width='2' height='12' fill='%23201e1d'/%3E%3Crect x='11' y='7' width='2' height='7' fill='%23201e1d'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="./modernist-styles.css">
+<link rel="stylesheet" href="./app.css">
+</head>
+<body>
+<a class="skip-link" href="#workspace">Skip to transfer controls</a>
+
+<div class="app">
+  <header class="site-header">
+    <a class="brand" href="./" aria-label="AKT home">
+      <span class="brand-mark" aria-hidden="true">
+        <i></i><i></i><i></i><i></i>
+      </span>
+      <span class="brand-name">AKT</span>
+      <span class="brand-long">Acoustic Key Transfer</span>
+    </a>
+    <div class="local-note">
+      <span class="local-dot" aria-hidden="true"></span>
+      <span>Browser only</span>
+      <span class="local-detail">· no account · no pairing</span>
+    </div>
+  </header>
+
+  <main class="shell" id="main">
+    <section class="intro" aria-labelledby="pageTitle">
+      <div class="intro-copy">
+        <p class="eyebrow">Local audio transfer</p>
+        <h1 id="pageTitle">Transfer a secret<br><span>over audio.</span></h1>
+        <p class="lede">The sending device plays an encoded signal. The receiving device validates the complete payload before displaying it.</p>
+      </div>
+      <ol class="quick-steps" aria-label="How to transfer">
+        <li>
+          <span class="step-number">01</span>
+          <span><strong>Enable the microphone</strong> on the receiving device.</span>
+        </li>
+        <li>
+          <span class="step-number">02</span>
+          <span><strong>Start transmission</strong> on the sending device.</span>
+        </li>
+        <li>
+          <span class="step-number">03</span>
+          <span><strong>Compare fingerprints</strong> before using the payload.</span>
+        </li>
+      </ol>
+    </section>
+
+    <p class="boot-err" id="bootErr" role="alert" hidden>
+      <strong>Audio transfer could not start.</strong>
+      <span>This browser may not support the local audio module.</span>
+    </p>
+
+    <div class="workspace" id="workspace">
+      <!-- Send -->
+      <section class="panel send-panel" id="zoneSend" aria-labelledby="sendTitle">
+        <header class="panel-header">
+          <div>
+            <p class="panel-kicker"><span>01</span> Send</p>
+            <h2 id="sendTitle">Send from this device</h2>
+          </div>
+          <span class="role-tag">Speaker</span>
+        </header>
+
+        <p class="panel-intro">Enter a key, token, or message up to 120 UTF-8 bytes. The value is not persisted or sent over a network.</p>
+
+        <form class="secret-form">
+          <label class="field-label" for="secret">Payload</label>
+          <div class="field-row">
+            <input class="input secret-input mono" type="password" id="secret"
+              autocomplete="off" autocapitalize="off" spellcheck="false"
+              placeholder="Enter up to 120 UTF-8 bytes"
+              aria-describedby="count limitError">
+            <button type="button" class="btn btn-secondary reveal-btn" id="showBtn"
+              aria-pressed="false" disabled>Show</button>
+          </div>
+          <div class="field-meta">
+            <span id="countLabel">UTF-8 payload</span>
+            <span class="field-meta-actions">
+              <span class="mono" id="count" aria-live="polite">0 / 120 B</span>
+              <button type="button" class="field-clear" id="clearInputBtn"
+                aria-label="Clear payload" hidden>Clear</button>
+            </span>
+          </div>
+          <div class="capacity-meter" id="byteMeter" role="progressbar"
+            aria-label="Payload capacity" aria-valuemin="0" aria-valuemax="120"
+            aria-valuenow="0"><i id="byteMeterFill"></i></div>
+          <p class="field-error" id="limitError" role="alert" hidden></p>
+        </form>
+
+        <div class="fingerprint-card" id="sendFingerprint" hidden>
+          <div class="fingerprint-head">
+            <span>Payload fingerprint</span>
+            <span class="mono fingerprint-hex" id="fpHex"></span>
+          </div>
+          <div class="fp-words" id="fpWords" aria-label="Sender fingerprint"></div>
+          <p id="fpCaption">Verify this fingerprint against the receiving device.</p>
+        </div>
+
+        <div class="send-controls">
+          <button type="button" class="btn btn-secondary send-btn" id="playBtn" disabled>
+            <span class="send-icon" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span id="playBtnText">Start transmission</span>
+          </button>
+
+          <label class="volume-control" for="vol">
+            <span class="control-head">
+              <span>Speaker volume</span>
+              <output class="mono" id="volLabel" for="vol">50%</output>
+            </span>
+            <input type="range" id="vol" min="10" max="100" step="1" value="50">
+            <span class="range-ends" aria-hidden="true"><span>Low</span><span>High</span></span>
+          </label>
+        </div>
+
+        <div class="send-progress" id="sendProgress" hidden>
+          <div class="progress-head">
+            <strong id="sendState">Transmitting copy 1</strong>
+            <span class="mono" id="sendTime">0.0 / 0.0 s</span>
+          </div>
+          <div class="progress-track" id="sendProgressBar" role="progressbar"
+            aria-label="Current transmission progress" aria-valuemin="0"
+            aria-valuemax="100" aria-valuenow="0">
+            <i id="sendProgressFill"></i>
+          </div>
+        </div>
+
+        <p class="inline-alert" id="sendError" role="alert" hidden></p>
+        <div class="send-foot">
+          <span id="copyTime">Enter a payload to estimate transfer time</span>
+          <span>Repeats until stopped</span>
+        </div>
+      </section>
+
+      <!-- Listen -->
+      <section class="panel receive-panel" id="zoneLive" aria-labelledby="receiveTitle">
+        <header class="panel-header">
+          <div>
+            <p class="panel-kicker"><span>02</span> Receive</p>
+            <h2 id="receiveTitle" tabindex="-1">Receive on this device</h2>
+          </div>
+          <span class="status-tag" id="micStatus" data-state="off">
+            <i aria-hidden="true"></i><span id="micStatusText">Microphone off</span>
+          </span>
+        </header>
+
+        <p class="panel-intro">Enable the microphone and place this device near the sender. Incomplete copies are combined automatically.</p>
+
+        <div class="listen-state">
+          <div class="sound-orbit" id="soundOrbit" aria-hidden="true">
+            <span class="orbit-ring"></span>
+            <span class="orbit-core">
+              <i></i><i></i><i></i><i></i><i></i>
+            </span>
+          </div>
+          <div class="listen-copy">
+            <div class="live-line" id="liveLine" role="status" aria-live="polite">Receiver inactive</div>
+            <p id="liveTips">Enable the microphone to begin receiving.</p>
+          </div>
+        </div>
+
+        <button type="button" class="btn btn-primary listen-btn" id="micBtn">
+          <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20">
+            <path d="M12 15.5a3.5 3.5 0 0 0 3.5-3.5V6a3.5 3.5 0 1 0-7 0v6a3.5 3.5 0 0 0 3.5 3.5Z" fill="none" stroke="currentColor" stroke-width="1.8"/>
+            <path d="M5.8 11.5v.5a6.2 6.2 0 0 0 12.4 0v-.5M12 18.2V22M8.5 22h7" fill="none" stroke="currentColor" stroke-width="1.8"/>
+          </svg>
+          <span id="micBtnText">Enable microphone</span>
+        </button>
+        <p class="permission-note" id="permissionNote">Microphone access is required for reception.</p>
+
+        <div class="meter-block" id="meterBlock" hidden>
+          <div class="meter-head">
+            <span>Input signal</span>
+            <strong id="levelWord">No signal</strong>
+          </div>
+          <div class="level-meter" id="levelMeter" role="meter"
+            aria-label="Microphone input level" aria-valuemin="0"
+            aria-valuemax="100" aria-valuenow="0" data-zone="quiet">
+            <span class="meter-zone zone-quiet"></span>
+            <span class="meter-zone zone-good"></span>
+            <span class="meter-zone zone-clip"></span>
+            <i class="level-fill" id="levelFill"></i>
+            <b class="level-needle" id="levelNeedle"></b>
+          </div>
+          <div class="meter-labels" aria-hidden="true"><span>Low</span><span>Good</span><span>Clipping</span></div>
+          <p class="meter-hint" id="meterHint">Waiting for an input signal.</p>
+        </div>
+      </section>
+    </div>
+
+    <!-- Verified result -->
+    <section class="result-panel" id="zoneResult" aria-labelledby="resultTitle" hidden>
+      <div class="result-heading">
+        <div class="verified-mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="30" height="30">
+            <path d="m5 12.5 4.2 4.2L19.5 6.5" fill="none" stroke="currentColor" stroke-width="2.2"/>
+          </svg>
+        </div>
+        <div>
+          <p class="panel-kicker result-kicker">Payload verified</p>
+          <h2 id="resultTitle" tabindex="-1">Transfer complete</h2>
+          <p class="result-meta" id="resHead">Verified after 1 copy</p>
+        </div>
+      </div>
+
+      <div class="result-grid">
+        <div class="result-value">
+          <label class="field-label" for="resValue">Received payload</label>
+          <div class="result-field-row">
+            <input class="input mono" type="password" id="resValue" readonly
+              aria-label="Received payload">
+            <button type="button" class="btn btn-secondary" id="resReveal"
+              aria-pressed="false">Reveal</button>
+            <button type="button" class="btn btn-primary" id="resCopy">Copy payload</button>
+          </div>
+          <span class="sr-only" id="copyStatus" role="status" aria-live="polite"></span>
+        </div>
+
+        <div class="result-fingerprint">
+          <div class="fingerprint-head">
+            <span>Received fingerprint</span>
+            <span class="mono fingerprint-hex" id="resHex"></span>
+          </div>
+          <div class="fp-words fp-res" id="resFp" aria-label="Received fingerprint"></div>
+          <p>Confirm that all four words match the sender fingerprint.</p>
+        </div>
+      </div>
+
+      <button type="button" class="btn btn-secondary clear-btn" id="resClear">Clear received payload</button>
+    </section>
+
+    <section class="confidence-strip" aria-label="Transfer properties">
+      <div>
+        <span class="confidence-icon" aria-hidden="true">↗</span>
+        <p><strong>Audio-only transfer</strong><br>No account, pairing, or network relay.</p>
+      </div>
+      <div>
+        <span class="confidence-icon" aria-hidden="true">✓</span>
+        <p><strong>Integrity verified</strong><br>Invalid payloads are discarded.</p>
+      </div>
+      <div>
+        <span class="confidence-icon" aria-hidden="true">○</span>
+        <p><strong>No local history</strong><br>Clear payloads after use.</p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="footer-inner">
+      <details class="help-disc">
+        <summary>Transfer troubleshooting</summary>
+        <div class="help-content">
+          <p>Place the devices within 1 metre, point the speaker toward the microphone, and avoid covering either one. If copies keep failing, move closer before raising the volume.</p>
+          <p>On a phone call, hold the receiving device near the earpiece or speaker. Disabling the call app’s noise suppression can help.</p>
+        </div>
+      </details>
+
+      <details class="help-disc">
+        <summary>Timing &amp; technical details</summary>
+        <div class="reference-grid">
+          <div>
+            <h3>Approximate air time</h3>
+            <table class="table mono">
+              <thead><tr><th>Payload</th><th>Per copy</th></tr></thead>
+              <tbody>
+                <tr><td>20 bytes</td><td>13 sec</td></tr>
+                <tr><td>40 bytes</td><td>23 sec</td></tr>
+                <tr><td>64 bytes</td><td>34 sec</td></tr>
+                <tr><td>120 bytes</td><td>61 sec</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div>
+            <h3>Local audio interface</h3>
+            <div class="mono interface-list">
+              <code>transfer_encode(payload, volume)</code>
+              <code>TransferRx.ingest(chunk)</code>
+              <code>TransferRx.attempts()</code>
+              <span>48 kHz mono · max 120 UTF-8 bytes · CRC-32 verified</span>
+            </div>
+          </div>
+        </div>
+      </details>
+    </div>
+    <p class="footer-signoff"><strong>AKT</strong> encodes short UTF-8 payloads as audio.</p>
+  </footer>
+</div>
+
+<script type="module" src="./js/app.js"></script>
+</body>
+</html>

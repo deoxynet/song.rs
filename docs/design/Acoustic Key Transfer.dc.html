@@ -1,0 +1,362 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="_ds/modernist-11083ed6-c48d-4eef-80ce-0224d9b70fef/styles.css">
+<script src="_ds/modernist-11083ed6-c48d-4eef-80ce-0224d9b70fef/_ds_bundle.js"></script>
+<style>
+  body { margin: 0; }
+  a { color: var(--color-accent); }
+  a:hover { color: var(--color-accent-700); }
+</style>
+</helmet>
+
+<div style="min-height:100vh;background:var(--color-bg);color:var(--color-text);font-family:var(--font-body);font-size:13px">
+
+  <div style="display:flex;align-items:baseline;gap:var(--space-4);padding:var(--space-2) var(--space-4);border-bottom:2px solid var(--color-divider)">
+    <span style="font-family:var(--font-heading);font-weight:800;font-size:13px;letter-spacing:0.06em">AKT</span>
+    <span class="text-muted" style="font-family:ui-monospace,Menlo,monospace;font-size:11px">audio · 48000 Hz mono f32 · max 120 B · crc32</span>
+    <span class="text-muted" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-left:auto">states</span>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:0;background:var(--color-bg)">
+
+    <!-- IDLE -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span>IDLE</span><span class="text-muted">01</span>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:var(--space-2)">
+        <button type="button" class="btn btn-primary" style="justify-content:flex-start;padding:var(--space-3)">send</button>
+        <button type="button" class="btn btn-secondary" style="justify-content:flex-start;padding:var(--space-3)">receive</button>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;display:grid;gap:3px;margin-top:auto" class="text-muted">
+        <div>tx: encode → loop until stopped</div>
+        <div>rx: ingest → merge copies → verified payload</div>
+      </div>
+    </div>
+
+    <!-- TX.INPUT -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span>TX.INPUT</span><span class="text-muted">02</span>
+      </div>
+      <div style="display:flex;gap:var(--space-2)">
+        <input class="input" type="text" readonly value="••••••••••••••••••••••••••••••••••••••" aria-label="payload" style="font-family:ui-monospace,Menlo,monospace">
+        <button type="button" class="btn btn-secondary" style="flex:none">show</button>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px">
+        <span class="text-muted">payload</span><span>38 / 120 B</span>
+      </div>
+      <div style="height:2px;background:var(--color-neutral-300);position:relative">
+        <div style="position:absolute;inset:0 68% 0 0;background:var(--color-text)"></div>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;display:flex;justify-content:space-between" class="text-muted">
+        <span>copy time</span><span>22.0 s</span>
+      </div>
+      <div style="margin-top:auto"><button type="button" class="btn btn-primary btn-block" style="padding:var(--space-3)">next</button></div>
+    </div>
+
+    <!-- TX.INPUT overflow -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span>TX.INPUT — over limit</span><span class="text-muted">02b</span>
+      </div>
+      <div style="display:flex;gap:var(--space-2)">
+        <input class="input" type="text" readonly value="sk-live-9f2c8ab41d77e0356bbc41f9ee0a2d5c1088" aria-label="payload" style="font-family:ui-monospace,Menlo,monospace;border-color:var(--color-accent)">
+        <button type="button" class="btn btn-secondary" style="flex:none">hide</button>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px">
+        <span style="color:var(--color-accent-700)">over by 4 B</span><span style="color:var(--color-accent-700)">124 / 120 B</span>
+      </div>
+      <div style="height:2px;background:var(--color-neutral-300);position:relative">
+        <div style="position:absolute;inset:0;background:var(--color-accent)"></div>
+      </div>
+      <div style="margin-top:auto"><button type="button" class="btn btn-primary btn-block" disabled="{{ true }}" style="padding:var(--space-3)">next</button></div>
+    </div>
+
+    <!-- TX.READY -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span>TX.READY</span><span class="text-muted">03</span>
+      </div>
+      <div class="text-muted" style="font-family:ui-monospace,Menlo,monospace;font-size:11px">fingerprint · crc32</div>
+      <sc-if value="{{ fmtWords }}" hint-placeholder-val="{{ true }}">
+        <div style="font-family:var(--font-heading);font-weight:800;font-size:20px;letter-spacing:0.02em;line-height:1.3">RIVER CLAMP<br>OTTER VAULT</div>
+      </sc-if>
+      <sc-if value="{{ fmtHex }}" hint-placeholder-val="{{ false }}">
+        <div style="font-family:ui-monospace,Menlo,monospace;font-size:20px;letter-spacing:0.14em">3fa291c7</div>
+      </sc-if>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;display:grid;gap:3px;border-top:1px solid var(--color-divider);padding-top:var(--space-2)">
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">payload</span><span>38 B</span></div>
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">copy</span><span>22.0 s</span></div>
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">gap</span><span>500 ms</span></div>
+      </div>
+      <div style="margin-top:auto"><button type="button" class="btn btn-primary btn-block" style="padding:var(--space-3)">start</button></div>
+    </div>
+
+    <!-- TX.LOOP -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span style="color:var(--color-accent)">TX.LOOP</span><span class="text-muted">04</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:var(--space-6)">
+        <div style="display:flex;flex-direction:column;gap:var(--space-3)">
+          <div style="font-family:ui-monospace,Menlo,monospace;font-size:clamp(28px,4vw,44px);line-height:1">copy 3</div>
+          <div>
+            <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-bottom:5px">
+              <span class="text-muted">playhead</span><span>14.0 / 22.0 s</span>
+            </div>
+            <div style="height:10px;border:1px solid var(--color-text);position:relative">
+              <div style="position:absolute;inset:0 36% 0 0;background:var(--color-accent)"></div>
+            </div>
+          </div>
+          <div>
+            <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-bottom:5px">
+              <span class="text-muted">volume</span><span>{{ volumeLabel }}</span>
+            </div>
+            <div style="height:10px;border:1px solid var(--color-divider);background:var(--color-surface);position:relative">
+              <div style="position:absolute;top:0;bottom:0;left:0;width:{{ volumePct }};background:var(--color-text)"></div>
+            </div>
+          </div>
+          <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;display:grid;gap:3px;border-top:1px solid var(--color-divider);padding-top:var(--space-2)">
+            <div style="display:flex;justify-content:space-between"><span class="text-muted">elapsed</span><span>68.4 s</span></div>
+            <div style="display:flex;justify-content:space-between"><span class="text-muted">fingerprint</span><span>3fa291c7</span></div>
+            <div style="display:flex;justify-content:space-between"><span class="text-muted">no rx feedback channel</span><span>—</span></div>
+          </div>
+          <div style="margin-top:auto"><button type="button" class="btn btn-secondary btn-block" style="padding:var(--space-3)">stop</button></div>
+        </div>
+        <sc-if value="{{ showNotesBand }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;flex-direction:column;gap:5px">
+            <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px" class="text-muted">
+              <span>1000–2500 Hz</span><span>d3 g#3 c#4</span>
+            </div>
+            <div style="display:flex;align-items:flex-end;gap:2px;flex:1;min-height:120px;border-bottom:1px solid var(--color-text)">
+              <div style="flex:1;height:22%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:46%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:71%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:58%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:34%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:88%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:64%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:41%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:27%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:52%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:79%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:100%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:62%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:38%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:24%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:47%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:69%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:55%;background:var(--color-accent)"></div>
+              <div style="flex:1;height:31%;background:var(--color-neutral-400)"></div>
+              <div style="flex:1;height:18%;background:var(--color-neutral-300)"></div>
+              <div style="flex:1;height:12%;background:var(--color-neutral-300)"></div>
+              <div style="flex:1;height:8%;background:var(--color-neutral-300)"></div>
+              <div style="flex:1;height:6%;background:var(--color-neutral-300)"></div>
+              <div style="flex:1;height:5%;background:var(--color-neutral-300)"></div>
+            </div>
+            <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px" class="text-muted">quiet room · ≤1 m · speaker clear</div>
+          </div>
+        </sc-if>
+      </div>
+    </div>
+
+    <!-- RX.PERM -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span>RX.PERM</span><span class="text-muted">05</span>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;display:grid;gap:3px">
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">echoCancellation</span><span>false</span></div>
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">noiseSuppression</span><span>false</span></div>
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">autoGainControl</span><span>false</span></div>
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">sampleRate</span><span>48000</span></div>
+      </div>
+      <div style="margin-top:auto;display:grid;grid-template-columns:1fr auto;gap:var(--space-2)">
+        <button type="button" class="btn btn-primary" style="justify-content:flex-start;padding:var(--space-3)">grant microphone</button>
+        <button type="button" class="btn btn-secondary" style="padding:var(--space-3)">back</button>
+      </div>
+    </div>
+
+    <!-- RX.LISTEN -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span>RX.LISTEN</span><span class="text-muted">06</span>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:clamp(20px,3vw,30px);line-height:1">no signal</div>
+      <div>
+        <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-bottom:5px">
+          <span class="text-muted">level</span><span style="color:var(--color-accent-700)">quiet</span>
+        </div>
+        <div style="display:flex;height:12px;border:1px solid var(--color-text);position:relative">
+          <div style="flex:2;background:var(--color-neutral-300);border-right:1px solid var(--color-text)"></div>
+          <div style="flex:5;background:var(--color-neutral-200);border-right:1px solid var(--color-text)"></div>
+          <div style="flex:2;background:var(--color-neutral-300)"></div>
+          <div style="position:absolute;top:0;bottom:0;left:0;width:11%;background:var(--color-text)"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:10px;margin-top:4px" class="text-muted">
+          <span>quiet</span><span>good</span><span>clip</span>
+        </div>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;color:var(--color-accent-700)">reduce distance or raise tx volume</div>
+      <div style="margin-top:auto"><button type="button" class="btn btn-secondary btn-block" style="padding:var(--space-3)">stop</button></div>
+    </div>
+
+    <!-- RX.LOCK -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span style="color:var(--color-accent)">RX.LOCK</span><span class="text-muted">07</span>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:clamp(20px,3vw,30px);line-height:1;color:var(--color-accent-700)">preamble · copy 1</div>
+      <div>
+        <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-bottom:5px">
+          <span class="text-muted">progress</span><span>9.0 / 22.0 s</span>
+        </div>
+        <div style="height:10px;border:1px solid var(--color-accent);position:relative">
+          <div style="position:absolute;inset:0 59% 0 0;background:var(--color-accent)"></div>
+        </div>
+      </div>
+      <sc-if value="{{ showNotesBand }}" hint-placeholder-val="{{ true }}">
+        <div style="display:flex;align-items:flex-end;gap:2px;height:52px;border-bottom:1px solid var(--color-text)">
+          <div style="flex:1;height:34%;background:var(--color-neutral-400)"></div>
+          <div style="flex:1;height:58%;background:var(--color-accent)"></div>
+          <div style="flex:1;height:81%;background:var(--color-accent)"></div>
+          <div style="flex:1;height:46%;background:var(--color-neutral-400)"></div>
+          <div style="flex:1;height:92%;background:var(--color-accent)"></div>
+          <div style="flex:1;height:63%;background:var(--color-accent)"></div>
+          <div style="flex:1;height:29%;background:var(--color-neutral-400)"></div>
+          <div style="flex:1;height:71%;background:var(--color-accent)"></div>
+          <div style="flex:1;height:52%;background:var(--color-neutral-400)"></div>
+          <div style="flex:1;height:86%;background:var(--color-accent)"></div>
+          <div style="flex:1;height:44%;background:var(--color-neutral-400)"></div>
+          <div style="flex:1;height:67%;background:var(--color-accent)"></div>
+        </div>
+      </sc-if>
+      <div style="margin-top:auto"><button type="button" class="btn btn-secondary btn-block" style="padding:var(--space-3)">stop</button></div>
+    </div>
+
+    <!-- RX.MERGE -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span>RX.MERGE</span><span class="text-muted">08</span>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:clamp(17px,2.4vw,22px);line-height:1.2">copy 2 crc fail<br>merging into copy 3</div>
+      <div style="display:flex;gap:3px;align-items:center">
+        <div style="flex:1;height:8px;background:var(--color-neutral-400)"></div>
+        <div style="flex:1;height:8px;background:var(--color-neutral-400)"></div>
+        <div style="flex:1;height:8px;background:var(--color-accent)"></div>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;display:grid;gap:3px;border-top:1px solid var(--color-divider);padding-top:var(--space-2)">
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">attempts</span><span>2</span></div>
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">listening</span><span>64.2 s</span></div>
+        <div style="display:flex;justify-content:space-between"><span class="text-muted">level</span><span>good</span></div>
+      </div>
+      <div style="margin-top:auto"><button type="button" class="btn btn-secondary btn-block" style="padding:var(--space-3)">stop</button></div>
+    </div>
+
+    <!-- RX.STALL -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span>RX.STALL</span><span class="text-muted">09</span>
+      </div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:clamp(17px,2.4vw,22px);line-height:1.2">5 copies · 0 verified<br>still listening</div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;display:grid;gap:3px;border-top:1px solid var(--color-divider);padding-top:var(--space-2)">
+        <div>→ tx volume 80</div>
+        <div>→ distance ≤ 30 cm</div>
+        <div>→ silence fans, notifications</div>
+        <div>→ speaker facing mic, unobstructed</div>
+      </div>
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-top:1px solid var(--color-divider);padding-top:var(--space-2)">
+        <span class="text-muted">level</span><span style="color:var(--color-accent-700)">clip · lower tx volume</span>
+      </div>
+      <div style="margin-top:auto;display:grid;grid-template-columns:1fr auto;gap:var(--space-2)">
+        <button type="button" class="btn btn-secondary" style="justify-content:flex-start;padding:var(--space-3)">keep listening</button>
+        <button type="button" class="btn btn-secondary" style="padding:var(--space-3)">reset</button>
+      </div>
+    </div>
+
+    <!-- RX.OK -->
+    <div style="background:var(--color-bg);border-right:2px solid var(--color-divider);border-bottom:2px solid var(--color-divider);padding:var(--space-4);display:flex;flex-direction:column;gap:var(--space-3);min-height:230px">
+      <div style="display:flex;justify-content:space-between;font-family:ui-monospace,Menlo,monospace;font-size:11px;border-bottom:1px solid var(--color-divider);padding-bottom:5px">
+        <span style="color:var(--color-accent)">RX.OK</span><span class="text-muted">10</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:var(--space-6)">
+        <div style="display:flex;flex-direction:column;gap:var(--space-3)">
+          <div style="font-family:ui-monospace,Menlo,monospace;font-size:clamp(22px,3vw,34px);line-height:1">verified · copy 3</div>
+          <div style="display:flex;gap:var(--space-2)">
+            <input class="input" type="text" readonly value="••••••••••••••••••••••••••••••••••••••" aria-label="decoded payload" style="font-family:ui-monospace,Menlo,monospace">
+            <button type="button" class="btn btn-secondary" style="flex:none">reveal</button>
+            <button type="button" class="btn btn-primary" style="flex:none">copy</button>
+          </div>
+          <div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;display:grid;gap:3px;border-top:1px solid var(--color-divider);padding-top:var(--space-2)">
+            <div style="display:flex;justify-content:space-between"><span class="text-muted">length</span><span>38 B</span></div>
+            <div style="display:flex;justify-content:space-between"><span class="text-muted">crc32</span><span>3fa291c7</span></div>
+            <div style="display:flex;justify-content:space-between"><span class="text-muted">attempts</span><span>3</span></div>
+          </div>
+          <div style="margin-top:auto"><button type="button" class="btn btn-secondary btn-block" style="padding:var(--space-3)">clear</button></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:var(--space-2)">
+          <div class="text-muted" style="font-family:ui-monospace,Menlo,monospace;font-size:11px">cross-check with sender</div>
+          <sc-if value="{{ fmtWords }}" hint-placeholder-val="{{ true }}">
+            <div style="font-family:var(--font-heading);font-weight:800;font-size:clamp(20px,2.6vw,26px);line-height:1.3;color:var(--color-accent-700)">RIVER CLAMP<br>OTTER VAULT</div>
+          </sc-if>
+          <sc-if value="{{ fmtHex }}" hint-placeholder-val="{{ false }}">
+            <div style="font-family:ui-monospace,Menlo,monospace;font-size:clamp(20px,2.6vw,26px);letter-spacing:0.14em;color:var(--color-accent-700)">3fa291c7</div>
+          </sc-if>
+          <div class="text-muted" style="font-family:ui-monospace,Menlo,monospace;font-size:11px">mismatch → discard, retransmit</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:var(--space-8);padding:var(--space-4);border-top:2px solid var(--color-divider)">
+    <div>
+      <div class="text-muted" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-bottom:var(--space-2)">air time · (8·len + 60) × 60 ms</div>
+      <table class="table" style="font-family:ui-monospace,Menlo,monospace;font-size:12px">
+        <thead><tr><th>bytes</th><th>per copy</th></tr></thead>
+        <tbody>
+          <tr><td>20</td><td>13 s</td></tr>
+          <tr><td>40</td><td>23 s</td></tr>
+          <tr><td>64</td><td>34 s</td></tr>
+          <tr><td>120</td><td>61 s</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <div class="text-muted" style="font-family:ui-monospace,Menlo,monospace;font-size:11px;margin-bottom:var(--space-2)">interface</div>
+      <div style="font-family:ui-monospace,Menlo,monospace;font-size:12px;display:grid;gap:4px">
+        <div>transfer_encode(payload, volume) → Float32Array</div>
+        <div>transfer_encode_repeated(payload, volume, copies, gap_ms)</div>
+        <div>TransferRx.ingest(chunk) → bytes | null</div>
+        <div>TransferRx.attempts() → number</div>
+        <div class="text-muted">MAX_TRANSFER_PAYLOAD = 120 · 48000 Hz</div>
+      </div>
+    </div>
+  </div>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;fingerprintFormat&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;options&quot;:[&quot;words&quot;,&quot;hex&quot;,&quot;both&quot;],&quot;default&quot;:&quot;words&quot;,&quot;tsType&quot;:&quot;string&quot;},&quot;showNotesBand&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;},&quot;volume&quot;:{&quot;editor&quot;:&quot;range&quot;,&quot;min&quot;:0,&quot;max&quot;:100,&quot;step&quot;:5,&quot;default&quot;:50,&quot;tsType&quot;:&quot;number&quot;}}">
+class Component extends DCLogic {
+  renderVals() {
+    const fmt = this.props.fingerprintFormat ?? 'words';
+    const vol = this.props.volume ?? 50;
+    return {
+      fmtWords: fmt === 'words' || fmt === 'both',
+      fmtHex: fmt === 'hex' || fmt === 'both',
+      showNotesBand: this.props.showNotesBand ?? true,
+      volumePct: vol + '%',
+      volumeLabel: String(vol)
+    };
+  }
+}
+</script>
+</body>
+</html>

@@ -250,7 +250,16 @@ fn quantize(samples: &[f32], bits: u32) -> Vec<f32> {
 
 fn try_decode(audio: &[f32], payload: &[u8]) -> bool {
     let mut dec = Decoder::new();
-    matches!(dec.decode(audio), Ok(Some(ref d)) if d == payload)
+    match dec.decode(audio) {
+        Ok(Some(ref d)) => return d == payload,
+        Err(_) => return false,
+        Ok(None) => {}
+    }
+    // Any real reception is followed by channel silence; feed enough for the
+    // decoder's trailing-silence finalization to run its full analysis when
+    // end-preamble detection failed mid-stream.
+    let silence = vec![0.0f32; 10 * song_rs::protocol::SYMBOL_TOTAL_SAMPLES];
+    matches!(dec.decode(&silence), Ok(Some(ref d)) if d == payload)
 }
 
 // ── Individual distortion tests ──────────────────────────────────────
@@ -948,9 +957,11 @@ fn teams_spectral_filter(samples: &[f32], f1_atten_db: f64, f0_boost_db: f64) ->
 }
 
 #[test]
-#[should_panic]
 fn teams_f1_attenuation_moderate() {
-    // F1 attenuated 34 dB (~50x), F0 boosted 10 dB
+    // F1 attenuated 34 dB (~50x), F0 boosted 10 dB.
+    // Survives via the pilot-derived channel EQ retry: the in-band tilt is
+    // measured from the known pilot symbols and inverted before centroid
+    // classification.
     let p = b"teams moderate f1 attenuation";
     let audio = song_rs::encode(p, 50).unwrap();
     let filtered = teams_spectral_filter(&audio, 34.0, 10.0);
@@ -958,9 +969,9 @@ fn teams_f1_attenuation_moderate() {
 }
 
 #[test]
-#[should_panic]
 fn teams_f1_attenuation_heavy() {
-    // F1 attenuated 50 dB (~300x), F0 boosted 20 dB
+    // F1 attenuated 50 dB (~300x), F0 boosted 20 dB.
+    // Survives via channel EQ + matched-filter template retries.
     let p = b"teams heavy f1 attenuation";
     let audio = song_rs::encode(p, 50).unwrap();
     let filtered = teams_spectral_filter(&audio, 50.0, 20.0);
@@ -978,13 +989,182 @@ fn teams_f1_attenuation_extreme() {
 }
 
 #[test]
-#[should_panic]
 fn teams_full_pipeline() {
-    // Full Teams-like pipeline: spectral shaping + noise cancellation + AGC
+    // Full Teams-like pipeline: spectral shaping + noise cancellation + AGC.
+    // Worst-case channel ⇒ armored melody: the default Giant Steps head
+    // measurably loses certain note+vowel windows to tilt + denoising
+    // (every classifier rung fails on the same symbols — channel
+    // information loss), which is exactly why the margin-verified arpeggio
+    // exists and why the transfer profile always uses it.
     let p = b"teams full pipeline test";
-    let audio = song_rs::encode(p, 50).unwrap();
+    let audio = song_rs::encode_armored(p, 50).unwrap();
     let out = teams_spectral_filter(&audio, 40.0, 15.0);
     let out = apply_rnnoise(&out);
     let out = agc(&out, 0.3);
     assert!(try_decode(&out, p), "teams full pipeline");
+}
+
+// ── Jitter buffer time warp (NetEQ-style) ────────────────────────────
+//
+// WebRTC's jitter buffer time-stretches audio to adapt its depth: sustained
+// rate offsets of a few percent, and occasional outright insertion/removal
+// of a whole frame. This shifts symbol boundaries by far more than
+// wow/flutter and accumulates over a message.
+
+/// Resample with a slowly wandering rate: r(t) = 1 + depth·sin(2π f t).
+/// depth=0.02 at f=0.3 Hz accumulates ±~10 ms of drift over a message.
+fn time_warp(samples: &[f32], depth: f64, rate_hz: f64) -> Vec<f32> {
+    let mut out = Vec::with_capacity(samples.len());
+    let mut src = 0.0f64;
+    while (src as usize) + 1 < samples.len() {
+        let idx = src as usize;
+        let frac = (src - idx as f64) as f32;
+        out.push(samples[idx] + frac * (samples[idx + 1] - samples[idx]));
+        let t = out.len() as f64 / SAMPLE_RATE;
+        src += 1.0 + depth * (2.0 * std::f64::consts::PI * rate_hz * t).sin();
+    }
+    out
+}
+
+/// Drop `n` samples at `at` (jitter buffer accelerating: removes audio).
+fn drop_samples(samples: &[f32], at: usize, n: usize) -> Vec<f32> {
+    let mut out = samples[..at.min(samples.len())].to_vec();
+    if at + n < samples.len() {
+        out.extend_from_slice(&samples[at + n..]);
+    }
+    out
+}
+
+/// Insert `n` samples at `at` by repeating the preceding audio
+/// (waveform-similarity insertion, as NetEQ's preemptive expand does).
+fn insert_samples(samples: &[f32], at: usize, n: usize) -> Vec<f32> {
+    let at = at.min(samples.len());
+    let mut out = samples[..at].to_vec();
+    let rep_start = at.saturating_sub(n);
+    out.extend_from_slice(&samples[rep_start..at]);
+    out.extend_from_slice(&samples[at..]);
+    out
+}
+
+#[test]
+fn jitter_warp_1pct() {
+    let p = b"jitter warp one percent";
+    let audio = song_rs::encode(p, 50).unwrap();
+    assert!(try_decode(&time_warp(&audio, 0.01, 0.3), p), "1% time warp");
+}
+
+#[test]
+fn jitter_warp_2pct() {
+    let p = b"jitter warp two percent";
+    let audio = song_rs::encode(p, 50).unwrap();
+    assert!(try_decode(&time_warp(&audio, 0.02, 0.3), p), "2% time warp");
+}
+
+#[test]
+fn jitter_drop_20ms() {
+    // Jitter buffer accelerates: 20 ms (960 samples) removed mid-message.
+    let p = b"jitter buffer dropped a frame";
+    let audio = song_rs::encode(p, 50).unwrap();
+    let out = drop_samples(&audio, audio.len() / 2, 960);
+    assert!(try_decode(&out, p), "20 ms frame drop");
+}
+
+#[test]
+fn jitter_insert_20ms() {
+    // Jitter buffer expands: 20 ms inserted mid-message.
+    let p = b"jitter buffer inserted a frame";
+    let audio = song_rs::encode(p, 50).unwrap();
+    let out = insert_samples(&audio, audio.len() / 2, 960);
+    assert!(try_decode(&out, p), "20 ms frame insert");
+}
+
+// ── Competing speech (babble) ────────────────────────────────────────
+//
+// A second voice is the interference denoisers deliberately pass through,
+// and its harmonics land inside the F2 decision band. White noise is the
+// EASY case; this is the real-world one.
+
+/// Speech-shaped babble: white noise filtered to the long-term speech
+/// spectrum (flat to 500 Hz, −6 dB/octave above), amplitude-modulated at a
+/// syllabic ~3.5 Hz.
+fn babble(len: usize, seed: u32) -> Vec<f32> {
+    let mut st = seed;
+    let white: Vec<f32> = (0..len).map(|_| normal(&mut st)).collect();
+    let shaped = {
+        // -6 dB/octave above 500 Hz via one-pole lowpass at 500 Hz
+        let rc = 1.0 / (2.0 * std::f64::consts::PI * 500.0);
+        let dt = 1.0 / SAMPLE_RATE;
+        let alpha = (dt / (rc + dt)) as f32;
+        let mut y = 0.0f32;
+        white
+            .iter()
+            .map(|&x| {
+                y += alpha * (x - y);
+                y
+            })
+            .collect::<Vec<f32>>()
+    };
+    shaped
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let t = i as f64 / SAMPLE_RATE;
+            let syllabic =
+                (0.55 + 0.45 * (2.0 * std::f64::consts::PI * 3.5 * t).sin()) as f32;
+            s * syllabic
+        })
+        .collect()
+}
+
+/// Mix babble at a target signal-to-interference ratio (dB).
+fn add_babble(samples: &[f32], sir_db: f64, seed: u32) -> Vec<f32> {
+    let b = babble(samples.len(), seed);
+    let sig_power: f64 =
+        samples.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / samples.len() as f64;
+    let bab_power: f64 =
+        b.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / b.len() as f64;
+    let gain = ((sig_power / bab_power).sqrt() / 10.0f64.powf(sir_db / 20.0)) as f32;
+    samples.iter().zip(&b).map(|(&s, &n)| s + n * gain).collect()
+}
+
+#[test]
+fn babble_15db() {
+    let p = b"babble at fifteen dB SIR";
+    let audio = song_rs::encode(p, 50).unwrap();
+    assert!(try_decode(&add_babble(&audio, 15.0, 4242), p), "babble 15 dB SIR");
+}
+
+#[test]
+fn babble_10db() {
+    let p = b"babble at ten dB SIR";
+    let audio = song_rs::encode(p, 50).unwrap();
+    assert!(try_decode(&add_babble(&audio, 10.0, 4242), p), "babble 10 dB SIR");
+}
+
+#[test]
+fn babble_sweep() {
+    let p = b"babble SIR sweep data";
+    let audio = song_rs::encode(p, 50).unwrap();
+    eprintln!();
+    let mut lowest = f64::MAX;
+    for &sir in &[20.0, 15.0, 12.0, 10.0, 8.0, 5.0, 3.0] {
+        let ok = try_decode(&add_babble(&audio, sir, 4242), p);
+        eprintln!("  babble SIR {sir:>5.1} dB: {}", if ok { "PASS" } else { "FAIL" });
+        if ok {
+            lowest = sir;
+        }
+    }
+    eprintln!("  lowest passing SIR: {lowest:.0} dB");
+    assert!(try_decode(&add_babble(&audio, 15.0, 4242), p), "must survive 15 dB SIR babble");
+}
+
+#[test]
+fn babble_with_rnnoise() {
+    // Denoiser + competing speech: RNNoise passes speech-like interference
+    // through — the modem sees it nearly unattenuated.
+    let p = b"babble through rnnoise";
+    let audio = song_rs::encode(p, 50).unwrap();
+    let out = add_babble(&audio, 15.0, 777);
+    let out = apply_rnnoise(&out);
+    assert!(try_decode(&out, p), "babble 15 dB + RNNoise");
 }

@@ -1,0 +1,6 @@
+{
+  "name": "akt-web",
+  "private": true,
+  "type": "module",
+  "description": "Acoustic Key Transfer — static web UI over the song-rs WASM transfer profile. No build step; serve this directory statically."
+}

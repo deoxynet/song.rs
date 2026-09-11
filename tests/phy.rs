@@ -242,7 +242,7 @@ fn test_large_message_fragmented() {
     let message: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
     a.send(&message).unwrap();
 
-    let (a_ev, b_ev) = run_loopback(&mut a, &mut b, 300_000);
+    let (a_ev, b_ev) = run_loopback(&mut a, &mut b, 500_000);
 
     assert!(has_event(&a_ev, |e| matches!(e, PhyEvent::SendComplete)));
     let received = get_received(&b_ev).expect("B should receive fragmented message");
@@ -257,7 +257,7 @@ fn test_max_message() {
     let message: Vec<u8> = (0..2224).map(|i| (i % 256) as u8).collect();
     a.send(&message).unwrap();
 
-    let (a_ev, b_ev) = run_loopback(&mut a, &mut b, 600_000);
+    let (a_ev, b_ev) = run_loopback(&mut a, &mut b, 900_000);
 
     assert!(has_event(&a_ev, |e| matches!(e, PhyEvent::SendComplete)));
     let received = get_received(&b_ev).expect("B should receive max-size message");
@@ -524,7 +524,7 @@ fn test_fragmented_noisy() {
         &mut b,
         &mut |s| add_noise(s, 15.0),
         &mut |s| add_noise(s, 15.0),
-        300_000,
+        500_000,
     );
 
     assert!(has_event(&a_ev, |e| matches!(e, PhyEvent::SendComplete)));

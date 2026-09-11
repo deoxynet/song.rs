@@ -1,0 +1,20 @@
+[package]
+name = "song-rs-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "wasm-bindgen bindings for the song-rs secret-transfer profile"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+song-rs = { path = ".." }
+wasm-bindgen = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+
+# This crate is intentionally not part of the parent workspace.
+[workspace]
