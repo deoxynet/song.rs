@@ -7,13 +7,15 @@
 //! Primary target: 128 kbps mono, 20 ms frames — the high end of what a
 //! conferencing stack will negotiate on a good link.
 //!
-//! NOTE: 48 kHz mode only, like `robustness.rs` (8 kHz mode lacks the FFT
-//! resolution the decoder needs).
+//! NOTE: These channel helpers operate at 48 kHz, including RNNoise's required
+//! input rate. The core codec has separate 8 kHz coverage.
 
 #![cfg(not(feature = "8khz"))]
 
 use song_rs::{protocol, Decoder, StreamConfig, StreamRx, StreamTx};
 use opus::{Application, Bitrate, Channels};
+use nnnoiseless::DenoiseState;
+use rustfft::{num_complex::Complex, FftPlanner};
 
 const SAMPLE_RATE: u32 = 48000;
 /// 20 ms frames — the WebRTC/Teams default ptime.
@@ -147,11 +149,291 @@ fn agc(samples: &[f32], target_rms: f32) -> Vec<f32> {
     samples.iter().map(|&s| (s * gain).clamp(-1.0, 1.0)).collect()
 }
 
+/// Same voice-optimization model as robustness.rs: F0 boost, F1 suppression,
+/// and non-flat gain across F2. Applied to the whole continuous capture.
+fn call_spectral_tilt(samples: &[f32], attenuation_db: f64) -> Vec<f32> {
+    if attenuation_db == 0.0 {
+        return samples.to_vec();
+    }
+    let n = samples.len();
+    let mut bins: Vec<_> = samples.iter().map(|&s| Complex::new(s, 0.0)).collect();
+    let mut planner = FftPlanner::new();
+    planner.plan_fft_forward(n).process(&mut bins);
+    for (i, bin) in bins.iter_mut().enumerate() {
+        let hz = i.min(n - i) as f64 * SAMPLE_RATE as f64 / n as f64;
+        let gain_db = if hz < 250.0 {
+            15.0 * (1.0 - (hz - 208.0).abs() / 50.0).max(0.0)
+        } else if (400.0..=850.0).contains(&hz) {
+            -attenuation_db
+        } else if hz > 850.0 && hz < 2000.0 {
+            -attenuation_db * (1.0 - (hz - 850.0) / 1150.0)
+        } else if (2000.0..=2500.0).contains(&hz) {
+            -attenuation_db * 0.3
+        } else {
+            0.0
+        };
+        *bin *= 10.0f64.powf(gain_db / 20.0) as f32;
+    }
+    planner.plan_fft_inverse(n).process(&mut bins);
+    bins.iter().map(|bin| bin.re / n as f32).collect()
+}
+
+/// A single continuous RNNoise pass: preserve startup artifacts and delay.
+/// Never replay the first frame, reset at the preamble, or realign the output.
+fn rnnoise_continuous(samples: &[f32]) -> Vec<f32> {
+    let mut denoiser = DenoiseState::new();
+    let mut input = [0.0; DenoiseState::FRAME_SIZE];
+    let mut output = [0.0; DenoiseState::FRAME_SIZE];
+    let mut audio = Vec::with_capacity(samples.len() + input.len());
+    for frame in samples.chunks(input.len()) {
+        input.fill(0.0);
+        for (target, &sample) in input.iter_mut().zip(frame) {
+            *target = sample * 32767.0;
+        }
+        denoiser.process_frame(&mut output, &input);
+        audio.extend(output.iter().map(|sample| sample / 32767.0));
+    }
+    audio
+}
+
+fn continuous_call_decodes(
+    payload: &[u8],
+    track: &[f64],
+    bitrate: i32,
+    tilt_db: f64,
+    case: usize,
+) -> bool {
+    let prefix = case % 3 * SAMPLE_RATE as usize / 2 + case * 137 % 960;
+    continuous_call_decodes_after(payload, track, bitrate, tilt_db, case, prefix)
+}
+
+fn continuous_call_decodes_after(
+    payload: &[u8],
+    track: &[f64],
+    bitrate: i32,
+    tilt_db: f64,
+    case: usize,
+    prefix: usize,
+) -> bool {
+    let volume = if case % 3 == 0 { 10 } else { 50 };
+    let voice = song_rs::encode_with_pitch(payload, volume, Some(track)).unwrap();
+    continuous_call_decodes_frame_after(payload, &voice, bitrate, tilt_db, case, prefix)
+}
+
+fn continuous_call_decodes_frame_after(
+    payload: &[u8],
+    voice: &[f32],
+    bitrate: i32,
+    tilt_db: f64,
+    case: usize,
+    prefix: usize,
+) -> bool {
+    // Vary both DSP-frame phase and cold/settled startup. The background
+    // noise also runs before and after the transmission, as in a live call.
+    let mut capture = vec![0.0; prefix];
+    capture.extend_from_slice(voice);
+    capture.resize(capture.len() + SAMPLE_RATE as usize, 0.0);
+    let signal_power = voice.iter().map(|&s| (s as f64).powi(2)).sum::<f64>()
+        / voice.len() as f64;
+    let noise_rms = (signal_power.sqrt() / 10.0f64.powf(25.0 / 20.0)) as f32;
+    let mut rng = 9329 + case as u32;
+    for sample in &mut capture {
+        *sample += normal(&mut rng) * noise_rms;
+    }
+    let shaped = call_spectral_tilt(&capture, tilt_db);
+    let denoised = rnnoise_continuous(&shaped);
+    let received = opus_roundtrip(&denoised, bitrate, Application::Voip).0;
+    assert!(received.iter().all(|sample| sample.is_finite()));
+
+    let mut decoder = Decoder::new();
+    let mut delivered = 0;
+    for chunk in received.chunks([128, 511, 1024][case % 3]) {
+        // A failed acquisition may occur in background noise. A live
+        // receiver must still be able to find the subsequent valid frame.
+        if let Ok(Some(bytes)) = decoder.decode(chunk) {
+            assert_eq!(bytes, payload, "wrong call payload, case {case}, bitrate {bitrate}, tilt {tilt_db}");
+            delivered += 1;
+        }
+    }
+    assert!(delivered <= 1, "duplicate call delivery, case {case}");
+    eprintln!("call case={case} bitrate={bitrate} tilt={tilt_db} phase={prefix}: {}", delivered == 1);
+    delivered == 1
+}
+
+fn check_continuous_call_register(tilt_db: f64) {
+    let payload: Vec<u8> = [0x00, 0x55, 0xaa, 0xff, 0x1b, 0xe4, 0x72, 0x8d]
+        .into_iter().cycle().take(24).collect();
+    let mut failures = Vec::new();
+    for midi in 47..=66 {
+        let hz = 440.0 * 2.0f64.powf((midi as f64 - 69.0) / 12.0);
+        if !continuous_call_decodes(&payload, &vec![hz; payload.len()], 24_000, tilt_db, midi - 47) {
+            failures.push(midi);
+        }
+    }
+    assert!(failures.is_empty(), "continuous-call failed pitches: {failures:?}, tilt {tilt_db}");
+}
+
+#[test]
+fn opus_continuous_call_register() {
+    check_continuous_call_register(0.0);
+}
+
+#[test]
+fn opus_continuous_call_register_tilted() {
+    check_continuous_call_register(40.0);
+}
+
+#[test]
+fn opus_continuous_call_contours() {
+    let payload: Vec<u8> = (0..60).map(|i| (i * 73 + 41) as u8).collect();
+    let mut failures = Vec::new();
+    for contour in 0..4 {
+        let track: Vec<f64> = (0..payload.len()).map(|i| {
+            let step = match contour {
+                0 => i % 20,
+                1 => 19 - i % 20,
+                2 => if i % 2 == 0 { i / 2 % 10 } else { 19 - i / 2 % 10 },
+                _ => (i * 13 + 7) % 20,
+            };
+            440.0 * 2.0f64.powf((47.0 + step as f64 - 69.0) / 12.0)
+        }).collect();
+        for bitrate in [16_000, 24_000, 128_000] {
+            for tilt in [0.0, 40.0] {
+                if !continuous_call_decodes(&payload, &track, bitrate, tilt, contour) {
+                    failures.push((contour, bitrate, tilt));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "continuous-call failed contours: {failures:?}");
+}
+
+#[test]
+fn opus_continuous_call_after_long_idle() {
+    let payload: Vec<u8> = (0..40).map(|i| (i * 73 + 41) as u8).collect();
+    let track = protocol::default_byte_pitch(payload.len());
+    for case in [1, 3] {
+        for tilt in [0.0, 40.0] {
+            let prefix = 5 * SAMPLE_RATE as usize + case * 137;
+            assert!(continuous_call_decodes_after(&payload, &track, 24_000, tilt, case, prefix),
+                "call after five seconds of background, case {case}, tilt {tilt}");
+        }
+    }
+}
+
+#[test]
+fn opus_continuous_call_maximum_frame_after_long_idle() {
+    let payload: Vec<u8> = (0..protocol::MAX_LENGTH_VARIABLE)
+        .map(|i| (i * 73 + 41) as u8).collect();
+    let track: Vec<f64> = (0..payload.len()).map(|i| {
+        let midi = 47.0 + ((i * 13 + 7) % 20) as f64;
+        440.0 * 2.0f64.powf((midi - 69.0) / 12.0)
+    }).collect();
+    for case in [1, 3] {
+        for tilt in [0.0, 40.0] {
+            let prefix = 5 * SAMPLE_RATE as usize + case * 137;
+            assert!(continuous_call_decodes_after(&payload, &track, 24_000, tilt, case, prefix),
+                "maximum-length call after idle, case {case}, tilt {tilt}");
+        }
+    }
+}
+
+#[test]
+fn opus_continuous_call_damaged_header_after_idle() {
+    let mut failures = Vec::new();
+    for len in [40, protocol::MAX_LENGTH_VARIABLE] {
+        let payload: Vec<u8> = (0..len).map(|i| (i * 73 + 41) as u8).collect();
+        let track: Vec<f64> = (0..len).map(|i| {
+            let midi = 47.0 + ((i * 13 + 7) % 20) as f64;
+            440.0 * 2.0f64.powf((midi - 69.0) / 12.0)
+        }).collect();
+        for case in [1, 3] {
+            let volume = if case == 3 { 10 } else { 50 };
+            let mut frame = song_rs::encode_with_pitch(&payload, volume, Some(&track)).unwrap();
+            let mut header = song_rs::reed_solomon::ReedSolomon::new(1, 2).encode(&[len as u8]);
+            header[0] ^= 0x5a;
+            header[1] ^= 0x5a;
+            for (i, vowel) in song_rs::formant::bytes_to_symbols(&header).into_iter().enumerate() {
+                let pos = protocol::PREAMBLE_LEN + protocol::PILOT_LEN + i;
+                let slot: Vec<f32> = song_rs::formant::synthesize_symbol(
+                    vowel, protocol::FRAMING_LICK[pos],
+                    volume as f64 / 100.0 * protocol::melody_accent(pos), pos,
+                ).into_iter().map(|sample| sample as f32).collect();
+                frame[pos * CHUNK..(pos + 1) * CHUNK].copy_from_slice(&slot);
+            }
+            for tilt in [0.0, 40.0] {
+                let prefix = 5 * SAMPLE_RATE as usize + case * 137;
+                if !continuous_call_decodes_frame_after(&payload, &frame, 24_000, tilt, case, prefix) {
+                    failures.push((len, case, tilt));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "damaged-header continuous calls failed: {failures:?}");
+}
+
+#[test]
+fn opus_continuous_call_sequential_frames_without_resets() {
+    let payloads: Vec<Vec<u8>> = [140, 1, 40].into_iter().enumerate()
+        .map(|(case, len)| (0..len).map(|i| (i * 73 + 41 + case) as u8).collect())
+        .collect();
+    let frames: Vec<Vec<f32>> = payloads.iter().enumerate().map(|(case, bytes)| {
+        let track: Vec<f64> = (0..bytes.len()).map(|i| {
+            let midi = 47.0 + ((i * 13 + case * 7) % 20) as f64;
+            440.0 * 2.0f64.powf((midi - 69.0) / 12.0)
+        }).collect();
+        song_rs::encode_with_pitch(bytes, if case == 1 { 10 } else { 50 }, Some(&track)).unwrap()
+    }).collect();
+    let mut failures = Vec::new();
+    for gap_ms in [0, 180] {
+        for tilt in [0.0, 40.0] {
+            let mut capture = vec![0.0; 5 * SAMPLE_RATE as usize + 137];
+            for (i, frame) in frames.iter().enumerate() {
+                if i > 0 {
+                    capture.resize(capture.len() + gap_ms * SAMPLE_RATE as usize / 1000, 0.0);
+                }
+                capture.extend(frame);
+            }
+            capture.resize(capture.len() + SAMPLE_RATE as usize, 0.0);
+            let rms = (frames[0].iter().map(|&s| (s as f64).powi(2)).sum::<f64>()
+                / frames[0].len() as f64).sqrt();
+            let noise_rms = (rms / 10.0f64.powf(25.0 / 20.0)) as f32;
+            let mut rng = 18751;
+            for sample in &mut capture {
+                *sample += normal(&mut rng) * noise_rms;
+            }
+            let shaped = call_spectral_tilt(&capture, tilt);
+            let denoised = rnnoise_continuous(&shaped);
+            let received = opus_roundtrip(&denoised, 24_000, Application::Voip).0;
+            let mut decoder = Decoder::new();
+            let mut deliveries = Vec::new();
+            for chunk in received.chunks(511) {
+                if let Ok(Some(bytes)) = decoder.decode(chunk) {
+                    assert!(payloads.contains(&bytes), "incorrect sequential-call payload");
+                    deliveries.push(bytes);
+                }
+            }
+            let lengths: Vec<_> = deliveries.iter().map(Vec::len).collect();
+            eprintln!("sequential call gap={gap_ms}ms tilt={tilt}: {lengths:?}");
+            if deliveries != payloads {
+                failures.push((gap_ms, tilt, lengths));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "lost, reordered, or duplicate sequential-call deliveries: {failures:?}");
+}
+
 // ── Decode helpers ───────────────────────────────────────────────────
 
 fn try_decode(audio: &[f32], payload: &[u8]) -> bool {
     let mut dec = Decoder::new();
-    matches!(dec.decode(audio), Ok(Some(ref d)) if d == payload)
+    match dec.decode(audio) {
+        Ok(Some(bytes)) => {
+            assert_eq!(bytes, payload, "Opus returned an incorrect payload");
+            true
+        }
+        _ => false,
+    }
 }
 
 fn stream_encode(data: &[u8], config: StreamConfig) -> Vec<f32> {
@@ -181,8 +463,7 @@ fn stream_decode(audio: &[f32], config: StreamConfig) -> Vec<u8> {
 
 /// Over-the-air duration of a one-shot frame for a given payload size.
 fn frame_duration_secs(payload_len: usize) -> f64 {
-    let n_ecc = protocol::ecc_bytes_for_length(payload_len);
-    let total_bytes = protocol::ENCODED_DATA_OFFSET + payload_len + n_ecc;
+    let total_bytes = protocol::EccProfile::Standard.encoded_bytes(payload_len);
     let n_data = song_rs::formant::symbols_for_bytes(total_bytes);
     let symbols =
         protocol::PREAMBLE_LEN + protocol::PILOT_LEN + n_data + protocol::PREAMBLE_LEN;
@@ -337,6 +618,7 @@ fn opus_128k_latency_throughput() {
     );
 
     let mut last_stats = None;
+    let mut one_byte_compute = std::time::Duration::ZERO;
     for &size in &[1usize, 10, 25, 50, 100, 140] {
         let p: Vec<u8> = (0..size).map(|i| 0x20 + (i * 7 % 90) as u8).collect();
 
@@ -350,6 +632,10 @@ fn opus_128k_latency_throughput() {
         let mut dec = Decoder::new();
         let got = dec.decode(&out).unwrap();
         let modem_dec = t1.elapsed();
+        assert_eq!(got.as_deref(), Some(p.as_slice()), "latency benchmark payload, {size} bytes");
+        if size == 1 {
+            one_byte_compute = modem_dec;
+        }
 
         let air = st.audio_secs;
         eprintln!(
@@ -418,10 +704,14 @@ fn opus_128k_latency_throughput() {
     let air_1b = frame_duration_secs(1) * 1000.0;
     eprintln!();
     eprintln!("=== One-way latency budget, 1-byte frame (excl. network/jitter buffer) ===");
-    eprintln!("  air time           {:.0} ms  (8 preamble + 4 data symbols @ 60 ms)", air_1b);
+    let frame_symbols = 2 * protocol::PREAMBLE_LEN + protocol::PILOT_LEN
+        + 4 * protocol::EccProfile::Standard.encoded_bytes(1);
+    eprintln!("  air time           {:.0} ms  ({frame_symbols} symbols, including sync/header/CRC/RS)", air_1b);
     eprintln!("  opus algorithmic   {:.1} ms", st.algorithmic_delay_ms());
-    eprintln!("  modem decode       <1 ms (compute; runs faster than real time)");
-    eprintln!("  total              ~{:.0} ms", air_1b + st.algorithmic_delay_ms());
+    eprintln!("  bulk decode        {:.1} ms (measured whole-buffer compute, not end-to-end latency)",
+        one_byte_compute.as_secs_f64() * 1000.0);
+    eprintln!("  air + opus delay   ~{:.0} ms (excludes receiver scheduling/compute)",
+        air_1b + st.algorithmic_delay_ms());
 
     assert!(stream_ok, "streaming codec must survive 128 kbps Opus");
 }
@@ -470,12 +760,21 @@ fn opus_roundtrip_lossy(samples: &[f32], lost: impl Fn(usize) -> bool) -> Vec<f3
 fn try_decode_with_tail(audio: &[f32], payload: &[u8]) -> bool {
     let mut dec = Decoder::new();
     match dec.decode(audio) {
-        Ok(Some(ref d)) => return d == payload,
+        Ok(Some(bytes)) => {
+            assert_eq!(bytes, payload, "Opus returned an incorrect payload");
+            return true;
+        }
         Err(_) => return false,
         Ok(None) => {}
     }
     let silence = vec![0.0f32; 10 * CHUNK];
-    matches!(dec.decode(&silence), Ok(Some(ref d)) if d == payload)
+    match dec.decode(&silence) {
+        Ok(Some(bytes)) => {
+            assert_eq!(bytes, payload, "Opus returned an incorrect payload on finalization");
+            true
+        }
+        _ => false,
+    }
 }
 
 #[test]

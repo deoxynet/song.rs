@@ -5,9 +5,9 @@
 //! - AM radio (narrow bandpass + echo + noise)
 //! - Individual distortions at various severities
 //!
-//! NOTE: These tests are designed for 48kHz mode only. At 8kHz, FFT resolution
-//! is too low, RNNoise requires 48kHz, and bandwidth constraints prevent
-//! many channel simulations from working. Skip at 8kHz.
+//! NOTE: These channel helpers operate at 48 kHz, including RNNoise's required
+//! input rate. Core codec coverage also runs at 8 kHz; both rates use 50 ms
+//! analysis windows and therefore have the same 20 Hz FFT-bin spacing.
 
 #![cfg(not(feature = "8khz"))]
 
@@ -16,6 +16,149 @@ use nnnoiseless::DenoiseState;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 const SAMPLE_RATE: f64 = 48000.0;
+
+/// Exercise every chromatic pitch with every vowel, including sustained
+/// vowels and alternating extremes. A tune with mostly ASCII payloads can
+/// otherwise hide a bad note/vowel pairing behind its error correction.
+fn check_melody_register(name: &str, channel: impl Fn(&[f32]) -> Vec<f32>) {
+    let payload: Vec<u8> = [0x00, 0x55, 0xaa, 0xff, 0x1b, 0xe4, 0x72, 0x8d]
+        .into_iter()
+        .cycle()
+        .take(32)
+        .collect();
+    let mut failures = Vec::new();
+    for midi in 47..=66 {
+        let hz = 440.0 * 2.0f64.powf((midi as f64 - 69.0) / 12.0);
+        let track = vec![hz; payload.len()];
+        let audio = song_rs::encode_with_pitch(&payload, 50, Some(&track)).unwrap();
+        let ok = try_decode(&channel(&audio), &payload);
+        eprintln!("{name}: MIDI {midi} ({hz:.2} Hz): {ok}");
+        if !ok {
+            failures.push(midi);
+        }
+    }
+    assert!(failures.is_empty(), "failed pitches: {failures:?}");
+}
+
+#[test]
+fn melody_register_clean() {
+    check_melody_register("clean", |audio| audio.to_vec());
+}
+
+#[test]
+fn melody_register_reverb() {
+    check_melody_register("reverb", |audio| {
+        reverb(audio, &[(25.0, 0.25), (60.0, 0.15), (100.0, 0.1)])
+    });
+}
+
+#[test]
+fn melody_register_phone() {
+    check_melody_register("phone", |audio| {
+        add_noise(&mulaw_codec(&resample_8k(&bandpass(audio, 300.0, 3400.0))), 10.0, 42)
+    });
+}
+
+#[test]
+fn melody_register_teams() {
+    check_melody_register("teams", |audio| teams_spectral_filter(audio, 40.0, 15.0));
+}
+
+#[test]
+fn melody_register_denoised() {
+    check_melody_register("denoised", |audio| apply_rnnoise(&add_noise(audio, 20.0, 42)));
+}
+
+#[test]
+fn melody_register_teams_denoised() {
+    check_melody_register("teams denoised", |audio| {
+        apply_rnnoise(&teams_spectral_filter(audio, 40.0, 15.0))
+    });
+}
+
+#[test]
+fn melody_contours_teams_denoised() {
+    let payload: Vec<u8> = (0..64).map(|i| (i * 73 + 41) as u8).collect();
+    let tracks: Vec<Vec<f64>> = (0..4).map(|contour| {
+        (0..payload.len()).map(|i| {
+            let step = match contour {
+                0 => i % 20,
+                1 => 19 - i % 20,
+                2 => if i % 2 == 0 { i / 2 % 10 } else { 19 - i / 2 % 10 },
+                _ => (i * 13 + 7) % 20,
+            };
+            440.0 * 2.0f64.powf((47.0 + step as f64 - 69.0) / 12.0)
+        }).collect()
+    }).collect();
+    for (i, track) in tracks.iter().enumerate() {
+        let audio = song_rs::encode_with_pitch(&payload, 50, Some(track)).unwrap();
+        let channel = apply_rnnoise(&teams_spectral_filter(&audio, 40.0, 15.0));
+        assert!(try_decode(&channel, &payload), "melody contour {i}");
+    }
+}
+
+/// Vary content, ECC boundaries, melody, receiver phase, and feed size.
+/// In particular, short binary messages should not depend on a lucky ASCII
+/// vowel distribution or the extra parity available to longer messages.
+fn check_melody_payloads(name: &str, channel: impl Fn(&[f32]) -> Vec<f32>) {
+    use song_rs::protocol::SYMBOL_TOTAL_SAMPLES;
+    let mut failures = Vec::new();
+    for seed in 1..=3u32 {
+        for len in [1, 2, 3, 4, 5, 9, 10, 15, 31, 63, 100, 140] {
+            let mut state = seed * 7919 + len as u32;
+            let payload: Vec<u8> = (0..len).map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                (state >> 24) as u8
+            }).collect();
+            let track: Vec<f64> = (0..len).map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let midi = 47.0 + ((state >> 24) % 20) as f64;
+                440.0 * 2.0f64.powf((midi - 69.0) / 12.0)
+            }).collect();
+            let audio = song_rs::encode_with_pitch(&payload, 50, Some(&track)).unwrap();
+            let phase = (seed as usize * 379 + len * 123) % SYMBOL_TOTAL_SAMPLES;
+            let chunk_size = [128, 511, 1024][seed as usize - 1];
+            let mut received = vec![0.0; phase];
+            received.extend(channel(&audio));
+            received.extend(vec![0.0; 10 * SYMBOL_TOTAL_SAMPLES]);
+            let mut decoder = Decoder::new();
+            let mut ok = false;
+            for chunk in received.chunks(chunk_size) {
+                match decoder.decode(chunk) {
+                    Ok(Some(bytes)) => {
+                        assert_eq!(bytes, payload, "{name}, seed {seed}, length {len}: wrong payload");
+                        ok = true;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            }
+            eprintln!("{name}: seed={seed} length={len} phase={phase} chunk={chunk_size}: {ok}");
+            if !ok { failures.push((seed, len)); }
+        }
+    }
+    assert!(failures.is_empty(), "{name}: failed seed/length pairs {failures:?}");
+}
+
+#[test]
+fn melody_payload_sizes_clean() {
+    check_melody_payloads("clean", |audio| audio.to_vec());
+}
+
+#[test]
+fn melody_payload_sizes_phone() {
+    check_melody_payloads("phone", |audio| {
+        add_noise(&mulaw_codec(&resample_8k(&bandpass(audio, 300.0, 3400.0))), 10.0, 42)
+    });
+}
+
+#[test]
+fn melody_payload_sizes_teams_denoised() {
+    check_melody_payloads("teams denoised", |audio| {
+        apply_rnnoise(&teams_spectral_filter(audio, 40.0, 15.0))
+    });
+}
 
 // ── DSP helpers ──────────────────────────────────────────────────────
 
@@ -251,7 +394,10 @@ fn quantize(samples: &[f32], bits: u32) -> Vec<f32> {
 fn try_decode(audio: &[f32], payload: &[u8]) -> bool {
     let mut dec = Decoder::new();
     match dec.decode(audio) {
-        Ok(Some(ref d)) => return d == payload,
+        Ok(Some(ref d)) => {
+            assert_eq!(d, payload, "decoder returned a wrong payload");
+            return true;
+        }
         Err(_) => return false,
         Ok(None) => {}
     }
@@ -259,7 +405,13 @@ fn try_decode(audio: &[f32], payload: &[u8]) -> bool {
     // decoder's trailing-silence finalization to run its full analysis when
     // end-preamble detection failed mid-stream.
     let silence = vec![0.0f32; 10 * song_rs::protocol::SYMBOL_TOTAL_SAMPLES];
-    matches!(dec.decode(&silence), Ok(Some(ref d)) if d == payload)
+    match dec.decode(&silence) {
+        Ok(Some(ref d)) => {
+            assert_eq!(d, payload, "decoder returned a wrong payload after silence");
+            true
+        }
+        _ => false,
+    }
 }
 
 // ── Individual distortion tests ──────────────────────────────────────
@@ -292,8 +444,69 @@ fn resample_8k_only() {
     assert!(try_decode(&resample_8k(&audio), p));
 }
 
-// echo_50ms removed: Echo at exactly symbol period (50ms) is pathological.
-// Real echoes have varying delays, not perfectly aligned to symbol timing.
+fn check_delayed_echo_melodies(clocks: &[f64], lengths: &[usize]) {
+    use song_rs::protocol::SYMBOL_TOTAL_SAMPLES;
+    let mut failures = Vec::new();
+    let mut cases = 0;
+    for transfer_profile in [false, true] {
+        for &length in lengths {
+            let length = length.min(if transfer_profile { song_rs::transfer::MAX_TRANSFER_PAYLOAD } else { 140 });
+            for contour in [1, 2, 3] {
+                let (payload, song, _) = clocked_melody_frame(length, contour, transfer_profile);
+                let mut input = vec![0.0; 8 * SYMBOL_TOTAL_SAMPLES + SYMBOL_TOTAL_SAMPLES / 3 + 137];
+                input.extend_from_slice(&song);
+                input.resize(input.len() + 12 * SYMBOL_TOTAL_SAMPLES, 0.0);
+                for delay in [5.0, 25.0, 50.0, 60.0, 65.0, 120.0] {
+                    let echo = add_echo(&input, delay, 0.5);
+                    for &ratio in clocks {
+                        let capture = if ratio == 1.0 { echo.clone() } else { resample_constant_clock(&echo, ratio) };
+                        let mut decoder = Decoder::new();
+                        let mut transfer = song_rs::transfer::TransferRx::new();
+                        let mut received = Vec::new();
+                        let mut errors = 0;
+                        for chunk in capture.chunks(511) {
+                            let result = if transfer_profile { Ok(transfer.ingest(chunk)) } else { decoder.decode(chunk) };
+                            match result {
+                                Ok(Some(bytes)) => {
+                                    assert_eq!(bytes, payload, "echo delivered incorrect bytes");
+                                    received.push(bytes);
+                                }
+                                Err(_) => errors += 1,
+                                _ => {}
+                            }
+                        }
+                        cases += 1;
+                        if received != vec![payload.clone()] {
+                            eprintln!("echo failed: transfer={transfer_profile} length={length} contour={contour} delay={delay} ratio={ratio}, deliveries={}, errors={errors}, attempts={}",
+                                received.len(), transfer.attempts());
+                            failures.push((transfer_profile, length, contour, delay, ratio));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("echo: {cases} cases, {} failures", failures.len());
+    assert!(failures.is_empty(), "echo failures: {failures:?}");
+}
+
+#[test]
+fn delayed_echoes_preserve_melody_contours() {
+    check_delayed_echo_melodies(&[1.0], &[17, 64]);
+}
+
+#[test]
+fn short_echoes_preserve_melody_payloads() {
+    // These frames can be too short for the stable-envelope clock estimate.
+    // Existing timing/classifier recovery must still handle the smallest songs.
+    let lengths: Vec<_> = (1..=16).collect();
+    check_delayed_echo_melodies(&[1.0, 0.98, 1.02], &lengths);
+}
+
+#[test]
+fn clocked_echoes_preserve_melody_payload_sizes() {
+    check_delayed_echo_melodies(&[0.98, 1.02], &[17, 64, 140]);
+}
 
 #[test]
 fn echo_100ms() {
@@ -979,29 +1192,32 @@ fn teams_f1_attenuation_heavy() {
 }
 
 #[test]
-#[should_panic]
 fn teams_f1_attenuation_extreme() {
     // F1 attenuated 66 dB (~2000x) — matches worst case from real Teams call
     let p = b"teams extreme f1 attenuation";
     let audio = song_rs::encode(p, 50).unwrap();
     let filtered = teams_spectral_filter(&audio, 66.0, 38.0);
-    assert!(try_decode(&filtered, p), "teams extreme F1 attenuation");
+    // Recovery beyond the measured channel margin is optional; returning
+    // incorrect bytes is never acceptable (enforced by try_decode).
+    let _ = try_decode(&filtered, p);
 }
 
 #[test]
 fn teams_full_pipeline() {
     // Full Teams-like pipeline: spectral shaping + noise cancellation + AGC.
-    // Worst-case channel ⇒ armored melody: the default Giant Steps head
-    // measurably loses certain note+vowel windows to tilt + denoising
-    // (every classifier rung fails on the same symbols — channel
-    // information loss), which is exactly why the margin-verified arpeggio
-    // exists and why the transfer profile always uses it.
+    // Both the default tune and the armored arpeggio must survive.
     let p = b"teams full pipeline test";
-    let audio = song_rs::encode_armored(p, 50).unwrap();
-    let out = teams_spectral_filter(&audio, 40.0, 15.0);
-    let out = apply_rnnoise(&out);
-    let out = agc(&out, 0.3);
-    assert!(try_decode(&out, p), "teams full pipeline");
+    for armored in [false, true] {
+        let audio = if armored {
+            song_rs::encode_armored(p, 50).unwrap()
+        } else {
+            song_rs::encode(p, 50).unwrap()
+        };
+        let out = teams_spectral_filter(&audio, 40.0, 15.0);
+        let out = apply_rnnoise(&out);
+        let out = agc(&out, 0.3);
+        assert!(try_decode(&out, p), "teams full pipeline, armored={armored}");
+    }
 }
 
 // ── Jitter buffer time warp (NetEQ-style) ────────────────────────────
@@ -1024,6 +1240,236 @@ fn time_warp(samples: &[f32], depth: f64, rate_hz: f64) -> Vec<f32> {
         src += 1.0 + depth * (2.0 * std::f64::consts::PI * rate_hz * t).sin();
     }
     out
+}
+
+#[test]
+fn block_clock_drift_through_phone_noise_and_denoising() {
+    let payload: Vec<_> = (0..64).map(|i| (i * 73 + 19) as u8).collect();
+    let track: Vec<_> = (0..payload.len()).map(|i| {
+        let midi = 47.0 + ((i * 73 + 11) % 20) as f64 + [-0.3, 0.0, 0.3][i % 3];
+        440.0 * 2.0f64.powf((midi - 69.0) / 12.0)
+    }).collect();
+    let song = song_rs::encode_with_pitch(&payload, 50, Some(&track)).unwrap();
+    for ratio in [0.98, 1.02] {
+        let mut warped = Vec::with_capacity(song.len());
+        let mut position = 0.0;
+        while position < (song.len() - 1) as f64 {
+            let i = position as usize;
+            let f = (position - i as f64) as f32;
+            warped.push(song[i] * (1.0 - f) + song[i + 1] * f);
+            position += ratio;
+        }
+        for channel in 0..3 {
+            let audio = match channel {
+                0 => add_noise(&warped, 20.0, 42),
+                1 => mulaw_codec(&resample_8k(&bandpass(&warped, 300.0, 3400.0))),
+                _ => apply_rnnoise(&teams_spectral_filter(&warped, 40.0, 15.0)),
+            };
+            assert!(try_decode(&audio, &payload), "clock ratio {ratio}, channel {channel}");
+        }
+    }
+    assert!(try_decode(&time_warp(&song, 0.02, 0.07), &payload), "slowly wandering clock");
+}
+
+fn resample_constant_clock(samples: &[f32], ratio: f64) -> Vec<f32> {
+    let mut out = Vec::with_capacity(samples.len());
+    let mut position = 0.0;
+    while position < (samples.len() - 1) as f64 {
+        let index = position as usize;
+        let fraction = (position - index as f64) as f32;
+        out.push(samples[index] * (1.0 - fraction) + samples[index + 1] * fraction);
+        position += ratio;
+    }
+    out
+}
+
+fn clocked_melody_frame(length: usize, contour: usize, transfer_profile: bool) -> (Vec<u8>, Vec<f32>, u32) {
+    use song_rs::protocol::default_byte_pitch;
+    let mut state = (length * 7919 + contour * 379 + 17) as u32;
+    let payload: Vec<_> = (0..length).map(|_| {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        (state >> 24) as u8
+    }).collect();
+    let track_length = length + if transfer_profile { 4 } else { 0 };
+    let track = if contour == 3 { default_byte_pitch(track_length) } else {
+        (0..track_length).map(|i| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let step = match contour {
+                0 => (i % 20) as f64,
+                1 => if i % 2 == 0 { 19.0 } else { 0.0 },
+                _ => ((state >> 24) % 20) as f64 + [-0.3, 0.0, 0.3][i % 3],
+            };
+            440.0 * 2.0f64.powf((47.0 + step - 69.0) / 12.0)
+        }).collect()
+    };
+    let song = if transfer_profile {
+        if contour == 4 {
+            // Include the browser's ordinary armored melody alongside the
+            // expressive tracks; all use the real TransferRx CRC gate.
+            song_rs::transfer::encode(&payload, 50).unwrap()
+        } else {
+            let mut framed = payload.clone();
+            framed.extend(song_rs::transfer::crc32(&payload).to_le_bytes());
+            song_rs::encoder::encode_with_profile(
+                &framed, 50, Some(&track), song_rs::protocol::EccProfile::Paranoid,
+            ).unwrap()
+        }
+    } else {
+        song_rs::encode_with_pitch(&payload, 50, Some(&track)).unwrap()
+    };
+    (payload, song, state)
+}
+
+fn clocked_melody_channel(input: &[f32], channel: usize, seed: u32) -> Vec<f32> {
+    match channel {
+        0 => add_noise(&mulaw_codec(&resample_8k(&bandpass(input, 300.0, 3400.0))), 10.0, seed),
+        _ => apply_rnnoise(&teams_spectral_filter(input, 40.0, 15.0)),
+    }
+}
+
+fn clocked_melody_capture(
+    length: usize, contour: usize, ratio: f64, channel: usize, transfer_profile: bool,
+) -> (Vec<u8>, Vec<f32>, usize) {
+    use song_rs::protocol::SYMBOL_TOTAL_SAMPLES;
+    let (payload, song, state) = clocked_melody_frame(length, contour, transfer_profile);
+    let phase = (length * 123 + contour * 379 + 137) % SYMBOL_TOTAL_SAMPLES;
+    // Real leading silence lets the denoiser settle before the first note;
+    // filtering and suppression see the whole capture.
+    let mut input = vec![0.0; 8 * SYMBOL_TOTAL_SAMPLES + phase];
+    input.extend(resample_constant_clock(&song, ratio));
+    input.extend(vec![0.0; 12 * SYMBOL_TOTAL_SAMPLES]);
+    let capture = clocked_melody_channel(&input, channel, state);
+    (payload, capture, phase)
+}
+
+fn check_clocked_melody_payloads(channel: usize, transfer_profile: bool) {
+    use song_rs::protocol::SYMBOL_TOTAL_SAMPLES;
+    let mut failures = Vec::new();
+    let maximum = if transfer_profile { song_rs::transfer::MAX_TRANSFER_PAYLOAD } else { 140 };
+    for length in [1, 17, 64, maximum] {
+        for contour in 0..if transfer_profile { 5 } else { 4 } {
+            for ratio in [0.98, 1.02] {
+                let (payload, capture, phase) = clocked_melody_capture(length, contour, ratio, channel, transfer_profile);
+                let mut decoder = Decoder::new();
+                let mut transfer = song_rs::transfer::TransferRx::new();
+                let mut received = Vec::new();
+                let chunk_size = [128, 511, 1024, 2048][contour % 4];
+                let mut errors = Vec::new();
+                for (index, chunk) in capture.chunks(chunk_size).enumerate() {
+                    let result = if transfer_profile { Ok(transfer.ingest(chunk)) } else { decoder.decode(chunk) };
+                    match result {
+                        Ok(Some(bytes)) => {
+                            assert_eq!(bytes, payload,
+                                "transfer {transfer_profile}, channel {channel}, length {length}, contour {contour}, ratio {ratio}: wrong payload");
+                            received.push(bytes);
+                        }
+                        Err(_) => errors.push(index * chunk_size / SYMBOL_TOTAL_SAMPLES),
+                        _ => {}
+                    }
+                }
+                let ok = received == vec![payload.clone()];
+                eprintln!("clocked melody: transfer={transfer_profile} channel={channel} length={length} contour={contour} ratio={ratio} phase={phase}: {ok}");
+                if !ok {
+                    let receiving = if transfer_profile { transfer.is_locked() } else { decoder.is_receiving() };
+                    eprintln!("errors at slots {errors:?}, still receiving={receiving}, transfer attempts={}", transfer.attempts());
+                    failures.push((length, contour, ratio));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "transfer {transfer_profile}, channel {channel}: failed length/contour/clock cases {failures:?}");
+}
+
+#[test]
+fn clocked_melody_payload_sizes_phone() {
+    check_clocked_melody_payloads(0, false);
+}
+
+#[test]
+fn clocked_melody_payload_sizes_denoised() {
+    check_clocked_melody_payloads(1, false);
+}
+
+#[test]
+fn clocked_transfer_melody_payload_sizes_phone() {
+    check_clocked_melody_payloads(0, true);
+}
+
+#[test]
+fn clocked_transfer_melody_payload_sizes_denoised() {
+    check_clocked_melody_payloads(1, true);
+}
+
+fn consecutive_clocked_capture(
+    channel: usize, transfer_profile: bool, keep_end: bool, gap_slots: usize,
+) -> (Vec<Vec<u8>>, Vec<f32>, Vec<(usize, usize)>) {
+    use song_rs::protocol::{PREAMBLE_LEN, SYMBOL_TOTAL_SAMPLES};
+    let maximum = if transfer_profile { song_rs::transfer::MAX_TRANSFER_PAYLOAD } else { 140 };
+    let mut input = vec![0.0; 8 * SYMBOL_TOTAL_SAMPLES + SYMBOL_TOTAL_SAMPLES / 3 + 137];
+    let mut expected = Vec::new();
+    let mut ranges = Vec::new();
+    for (index, (length, contour, ratio, gain)) in [
+        (maximum, 2, 0.98, 1.0), (1, 0, 1.02, 0.5),
+        (17, 3, 1.0, 1.0), (1, 0, 1.02, 0.5),
+    ].into_iter().enumerate() {
+        let (payload, mut song, _) = clocked_melody_frame(length, contour, transfer_profile);
+        if index == 0 && !keep_end {
+            song.truncate(song.len() - PREAMBLE_LEN * SYMBOL_TOTAL_SAMPLES);
+        }
+        if index > 0 { input.resize(input.len() + gap_slots * SYMBOL_TOTAL_SAMPLES, 0.0); }
+        let start = input.len();
+        input.extend(resample_constant_clock(&song, ratio).into_iter().map(|sample| sample * gain));
+        ranges.push((start, input.len()));
+        expected.push(payload);
+    }
+    input.resize(input.len() + 12 * SYMBOL_TOTAL_SAMPLES, 0.0);
+    // One continuous channel pass, including the chosen inter-song gaps:
+    // no per-frame filter/denoiser resets or extra padding.
+    let capture = clocked_melody_channel(&input, channel, 27183);
+    (expected, capture, ranges)
+}
+
+fn check_consecutive_clocked_melodies(channel: usize) {
+    let mut failures = Vec::new();
+    for transfer_profile in [false, true] {
+        for keep_end in [true, false] {
+            for gap_slots in [0, 3] {
+                let (expected, capture, ranges) = consecutive_clocked_capture(channel, transfer_profile, keep_end, gap_slots);
+                let mut decoder = Decoder::new();
+                let mut transfer = song_rs::transfer::TransferRx::new();
+                let mut received = Vec::new();
+                let mut errors = 0;
+                for chunk in capture.chunks(511) {
+                    let result = if transfer_profile { Ok(transfer.ingest(chunk)) } else { decoder.decode(chunk) };
+                    match result {
+                        Ok(Some(bytes)) => {
+                            assert!(expected.contains(&bytes), "incorrect consecutive melody payload");
+                            received.push(bytes);
+                        }
+                        Err(_) => errors += 1,
+                        _ => {}
+                    }
+                }
+                let lengths: Vec<_> = received.iter().map(Vec::len).collect();
+                eprintln!("consecutive clocked melodies: transfer={transfer_profile} channel={channel} end={keep_end} gap={gap_slots}: {lengths:?}, errors={errors}, attempts={}", transfer.attempts());
+                if received != expected {
+                    eprintln!("source frame sample ranges: {ranges:?}");
+                    failures.push((transfer_profile, keep_end, gap_slots, lengths));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "channel {channel}: lost, reordered, or duplicate clocked melodies {failures:?}");
+}
+
+#[test]
+fn consecutive_clocked_melodies_phone() {
+    check_consecutive_clocked_melodies(0);
+}
+
+#[test]
+fn consecutive_clocked_melodies_denoised() {
+    check_consecutive_clocked_melodies(1);
 }
 
 /// Drop `n` samples at `at` (jitter buffer accelerating: removes audio).

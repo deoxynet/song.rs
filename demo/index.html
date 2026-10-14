@@ -1,0 +1,732 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>song.rs — acoustic modem demo</title>
+  <style>
+    :root {
+      --bg: #0a0a0f;
+      --fg: #e8e8e8;
+      --accent: #00aaff;
+      --accent-dim: #006699;
+      --surface: #151520;
+      --border: #2a2a3a;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    body {
+      font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+      background: var(--bg);
+      color: var(--fg);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+      line-height: 1.6;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 2rem;
+    }
+
+    h1 {
+      font-size: 2rem;
+      font-weight: 400;
+      margin-bottom: 0.5rem;
+    }
+
+    h1 em {
+      font-style: normal;
+      color: var(--accent);
+    }
+
+    .tagline {
+      color: #888;
+      font-size: 0.9rem;
+    }
+
+    main {
+      width: 100%;
+      max-width: 800px;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1.5rem;
+    }
+
+    h2 {
+      font-size: 0.85rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: #666;
+      margin-bottom: 1rem;
+    }
+
+    /* Spectrogram */
+    #spectrogram-container {
+      width: 100%;
+      height: 200px;
+      background: #000;
+      border-radius: 4px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    #spectrogram {
+      width: 100%;
+      height: 100%;
+    }
+
+    #status-overlay {
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      padding: 4px 8px;
+      border-radius: 4px;
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      background: rgba(0, 0, 0, 0.7);
+    }
+
+    #status-overlay.listening { color: #666; }
+    #status-overlay.receiving { color: var(--accent); }
+    #status-overlay.done { color: #4a4; }
+
+    /* Samples */
+    .samples {
+      display: flex;
+      flex-direction: column;
+      gap: 1rem;
+    }
+
+    .sample {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      padding: 1rem;
+      background: rgba(0, 0, 0, 0.3);
+      border-radius: 4px;
+    }
+
+    .sample-info {
+      flex: 1;
+    }
+
+    .sample-title {
+      font-weight: 500;
+      margin-bottom: 0.25rem;
+    }
+
+    .sample-quote {
+      font-style: italic;
+      color: #888;
+      font-size: 0.9rem;
+    }
+
+    .sample button {
+      padding: 0.5rem 1rem;
+      background: var(--accent-dim);
+      color: var(--fg);
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.85rem;
+      transition: background 0.2s;
+    }
+
+    .sample button:hover {
+      background: var(--accent);
+    }
+
+    .sample button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    /* Decoder output */
+    #decoder-output {
+      min-height: 120px;
+      padding: 1rem;
+      background: #000;
+      border-radius: 4px;
+      font-size: 1.1rem;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    #decoder-output.receiving {
+      color: var(--accent-dim);
+      letter-spacing: 1px;
+    }
+
+    .symbol {
+      display: inline;
+      animation: fadeIn 0.15s ease-out;
+    }
+
+    @keyframes fadeIn {
+      from { opacity: 0; transform: translateY(2px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .cursor {
+      display: inline-block;
+      width: 2px;
+      height: 1.1em;
+      background: var(--accent);
+      margin-left: 2px;
+      animation: blink 1s step-end infinite;
+      vertical-align: text-bottom;
+    }
+
+    @keyframes blink {
+      50% { opacity: 0; }
+    }
+
+    /* Mic control */
+    #mic-section {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    #mic-btn {
+      padding: 0.75rem 1.5rem;
+      background: var(--accent-dim);
+      color: var(--fg);
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 0.9rem;
+      transition: background 0.2s;
+    }
+
+    #mic-btn:hover {
+      background: var(--accent);
+    }
+
+    #mic-btn.active {
+      background: #a44;
+    }
+
+    #mic-btn.active:hover {
+      background: #c55;
+    }
+
+    #mic-status {
+      color: #666;
+      font-size: 0.85rem;
+    }
+
+    /* Footer */
+    footer {
+      margin-top: 2rem;
+      text-align: center;
+      color: #444;
+      font-size: 0.8rem;
+    }
+
+    footer a {
+      color: var(--accent-dim);
+      text-decoration: none;
+    }
+
+    footer a:hover {
+      color: var(--accent);
+    }
+
+    /* Loading state */
+    .loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100px;
+      color: #666;
+    }
+
+    .loading::after {
+      content: '';
+      width: 20px;
+      height: 20px;
+      border: 2px solid var(--accent-dim);
+      border-top-color: transparent;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-left: 0.5rem;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><em>song.rs</em></h1>
+    <p class="tagline">data encoded as vowels — survives noise cancellation by pretending to be human</p>
+  </header>
+
+  <main>
+    <section>
+      <h2>Spectrogram</h2>
+      <div id="spectrogram-container">
+        <canvas id="spectrogram"></canvas>
+        <div id="status-overlay" class="listening">listening</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Samples</h2>
+      <div class="samples">
+        <div class="sample">
+          <div class="sample-info">
+            <div class="sample-title">I. Shelley</div>
+            <div class="sample-quote">"Music, when soft voices die, / Vibrates in the memory—"</div>
+          </div>
+          <button onclick="playSample('shelley')">Play</button>
+        </div>
+        <div class="sample">
+          <div class="sample-info">
+            <div class="sample-title">II. First telegraph</div>
+            <div class="sample-quote">"What hath God wrought"</div>
+          </div>
+          <button onclick="playSample('morse')">Play</button>
+        </div>
+        <div class="sample">
+          <div class="sample-info">
+            <div class="sample-title">III. Dickinson</div>
+            <div class="sample-quote">"And then—a Plank in Reason, broke"</div>
+          </div>
+          <button onclick="playSample('dickinson')">Play</button>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Decoded</h2>
+      <div id="decoder-output"><span class="cursor"></span></div>
+    </section>
+
+    <section id="mic-section">
+      <button id="mic-btn" onclick="toggleMic()">Enable Microphone</button>
+      <span id="mic-status">Click to decode live audio</span>
+    </section>
+  </main>
+
+  <footer>
+    <a href="https://github.com/irdbl/song.rs">github.com/irdbl/song.rs</a>
+  </footer>
+
+  <script type="module">
+    import init, { WasmDecoder, sample_rate } from './pkg/song_rs_wasm.js';
+
+    // Global state
+    let decoder = null;
+    let audioContext = null;
+    let analyser = null;
+    let spectrogram = null;
+    let micStream = null;
+    let micSource = null;
+    let scriptProcessor = null;
+    let isPlaying = false;
+
+    // Spectrogram class (adapted from soundbin.io)
+    class Spectrogram {
+      constructor(canvas) {
+        this.canvas = canvas;
+        this.ctx = canvas.getContext('2d');
+        this.analyser = null;
+        this.dataArray = null;
+        this.animationId = null;
+        this.isRunning = false;
+        this.dpr = 1;
+        this.scrollSpeed = 2;
+
+        this.handleResize = this.handleResize.bind(this);
+        window.addEventListener('resize', this.handleResize);
+        this.handleResize();
+      }
+
+      handleResize() {
+        const rect = this.canvas.parentElement.getBoundingClientRect();
+        const dpr = window.devicePixelRatio || 1;
+
+        this.dpr = dpr;
+        this.canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+        this.canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+        this.canvas.style.width = rect.width + 'px';
+        this.canvas.style.height = rect.height + 'px';
+
+        this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        this.width = rect.width;
+        this.height = rect.height;
+
+        this.ctx.fillStyle = '#000';
+        this.ctx.fillRect(0, 0, this.width, this.height);
+      }
+
+      connect(audioContext, sourceNode) {
+        this.analyser = audioContext.createAnalyser();
+        this.analyser.fftSize = 4096;
+        this.analyser.smoothingTimeConstant = 0.05;
+        sourceNode.connect(this.analyser);
+        this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+      }
+
+      getColor(value) {
+        const raw = value / 255;
+        const intensity = Math.pow(raw, 0.6);
+        const r = Math.floor(intensity * intensity * 150);
+        const g = Math.floor(intensity * 200 + intensity * intensity * 55);
+        const b = Math.floor(Math.min(255, intensity * 255 + intensity * intensity * 50));
+        return `rgb(${r}, ${g}, ${b})`;
+      }
+
+      logScale(position, maxBin) {
+        const minBin = 20;
+        const logMin = Math.log(minBin);
+        const logMax = Math.log(maxBin);
+        const scale = logMin + position * (logMax - logMin);
+        return Math.exp(scale);
+      }
+
+      start() {
+        if (this.isRunning || !this.analyser) return;
+        if (this.width === 0 || this.height === 0) this.handleResize();
+        this.isRunning = true;
+        this.draw();
+      }
+
+      stop() {
+        this.isRunning = false;
+        if (this.animationId) {
+          cancelAnimationFrame(this.animationId);
+          this.animationId = null;
+        }
+      }
+
+      draw() {
+        if (!this.isRunning) return;
+        this.animationId = requestAnimationFrame(() => this.draw());
+        if (!this.analyser || !this.dataArray) return;
+        if (this.width <= 0 || this.height <= 0) return;
+
+        this.analyser.getByteFrequencyData(this.dataArray);
+
+        const scrollPx = Math.max(1, Math.round(this.scrollSpeed * this.dpr));
+        const pixelWidth = this.canvas.width;
+        const pixelHeight = this.canvas.height;
+
+        if (pixelWidth > scrollPx) {
+          const imageData = this.ctx.getImageData(scrollPx, 0, pixelWidth - scrollPx, pixelHeight);
+          this.ctx.putImageData(imageData, 0, 0);
+        }
+
+        const relevantBins = Math.floor(this.dataArray.length * 0.4);
+        const numRows = Math.floor(this.height);
+        const rowHeight = this.height / numRows;
+
+        for (let y = 0; y < numRows; y++) {
+          const position = 1 - (y / numRows);
+          const binIndex = this.logScale(position, relevantBins);
+          const binLow = Math.floor(binIndex);
+          const binHigh = Math.min(binLow + 1, relevantBins - 1);
+          const frac = binIndex - binLow;
+          const value = this.dataArray[binLow] * (1 - frac) + this.dataArray[binHigh] * frac;
+
+          this.ctx.fillStyle = this.getColor(value);
+          this.ctx.fillRect(
+            this.width - this.scrollSpeed,
+            y * rowHeight,
+            this.scrollSpeed,
+            rowHeight + 1
+          );
+        }
+      }
+
+      destroy() {
+        this.stop();
+        window.removeEventListener('resize', this.handleResize);
+        if (this.analyser) this.analyser.disconnect();
+      }
+    }
+
+    // UI Elements
+    const outputEl = document.getElementById('decoder-output');
+    const statusEl = document.getElementById('status-overlay');
+    const micBtn = document.getElementById('mic-btn');
+    const micStatus = document.getElementById('mic-status');
+
+    // Display decoded text with animation
+    let displayedText = '';
+    function updateOutput(text, isFinal = false) {
+      if (text === displayedText) return;
+
+      // Find new characters
+      const newChars = text.slice(displayedText.length);
+      displayedText = text;
+
+      // Clear and rebuild
+      outputEl.innerHTML = '';
+
+      // Add existing text
+      const existingSpan = document.createElement('span');
+      existingSpan.textContent = text.slice(0, text.length - newChars.length);
+      outputEl.appendChild(existingSpan);
+
+      // Add new characters with animation
+      for (const char of newChars) {
+        const span = document.createElement('span');
+        span.className = 'symbol';
+        span.textContent = char;
+        outputEl.appendChild(span);
+      }
+
+      // Add cursor if not final
+      if (!isFinal) {
+        const cursor = document.createElement('span');
+        cursor.className = 'cursor';
+        outputEl.appendChild(cursor);
+      }
+    }
+
+    function clearOutput() {
+      displayedText = '';
+      outputEl.innerHTML = '<span class="cursor"></span>';
+    }
+
+    function setStatus(state) {
+      statusEl.textContent = state;
+      statusEl.className = state;
+    }
+
+    // Initialize WASM and audio
+    async function initialize() {
+      await init();
+      decoder = new WasmDecoder();
+
+      audioContext = new AudioContext({ sampleRate: 48000 });
+      spectrogram = new Spectrogram(document.getElementById('spectrogram'));
+
+    }
+
+    // Process audio samples through decoder
+    function processAudio(samples) {
+      if (!decoder) return;
+
+      const result = decoder.feed(samples);
+
+      console.log('state:', result.state, 'symbols:', result.symbol_count, 'result:', !!result.result);
+      setStatus(result.state);
+
+      // Show progress blocks during reception (2 symbols = 1 byte = ~1 char)
+      if (result.state === 'receiving') {
+        const estimatedChars = Math.floor(result.symbol_count / 2) - 3; // minus header
+        if (estimatedChars > 0) {
+          outputEl.textContent = '█'.repeat(Math.min(estimatedChars, 200));
+          outputEl.classList.add('receiving');
+        }
+      }
+
+      // Reveal the final corrected result with animation
+      if (result.state === 'done') {
+        console.log('DONE! result:', result.result);
+        outputEl.classList.remove('receiving');
+        if (result.result) {
+          revealText(result.result);
+        }
+        decoder.reset();
+      }
+
+      if (result.error) {
+        console.log('ERROR:', result.error);
+        outputEl.classList.remove('receiving');
+        decoder.reset();
+      }
+    }
+
+    // Reveal text with blocks resolving to characters
+    function revealText(text) {
+      const len = text.length;
+      let revealed = 0;
+      const blocksRemaining = () => '█'.repeat(Math.max(0, len - revealed));
+
+      // Fast reveal: ~10ms per char, but batch for smoothness
+      const batchSize = Math.max(1, Math.floor(len / 50)); // reveal in ~50 steps
+      const interval = setInterval(() => {
+        revealed += batchSize;
+        if (revealed >= len) {
+          outputEl.textContent = text;
+          clearInterval(interval);
+        } else {
+          outputEl.textContent = text.slice(0, revealed) + blocksRemaining();
+        }
+      }, 15);
+    }
+
+    // Play a sample
+    window.playSample = async function(name) {
+      if (isPlaying) return;
+      isPlaying = true;
+
+      // Disable all buttons
+      document.querySelectorAll('.sample button').forEach(b => b.disabled = true);
+
+      clearOutput();
+      decoder.reset();
+
+      try {
+        // Resume audio context if suspended
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
+
+        // Fetch and decode audio file
+        const response = await fetch(`samples/${name}.mp3`);
+        const arrayBuffer = await response.arrayBuffer();
+        const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
+
+
+        // Create source
+        const source = audioContext.createBufferSource();
+        source.buffer = audioBuffer;
+
+        // Create a gain node as a hub for routing
+        const gainNode = audioContext.createGain();
+        gainNode.gain.value = 1.0;
+        source.connect(gainNode);
+        gainNode.connect(audioContext.destination);
+
+        // Connect to spectrogram
+        if (!spectrogram.analyser) {
+          spectrogram.connect(audioContext, gainNode);
+          spectrogram.start();
+        } else {
+          gainNode.connect(spectrogram.analyser);
+        }
+
+        // Create script processor for decoding (deprecated but works everywhere)
+        const processor = audioContext.createScriptProcessor(4096, 1, 1);
+        gainNode.connect(processor);
+        // Connect processor to a silent destination to keep it running
+        const silentGain = audioContext.createGain();
+        silentGain.gain.value = 0;
+        processor.connect(silentGain);
+        silentGain.connect(audioContext.destination);
+
+        processor.onaudioprocess = (e) => {
+          const samples = e.inputBuffer.getChannelData(0);
+          // Copy the samples since the buffer may be reused
+          processAudio(new Float32Array(samples));
+        };
+
+        source.onended = () => {
+          // Feed silence to flush decoder
+          const silence = new Float32Array(48000); // 1 second
+          const result = decoder.feed(silence);
+          if (result.result) {
+            outputEl.classList.remove('receiving');
+            revealText(result.result);
+          }
+          decoder.reset();
+          processor.disconnect();
+          silentGain.disconnect();
+          isPlaying = false;
+          document.querySelectorAll('.sample button').forEach(b => b.disabled = false);
+        };
+
+        source.start();
+
+      } catch (err) {
+        console.error('Failed to play sample:', err);
+        isPlaying = false;
+        document.querySelectorAll('.sample button').forEach(b => b.disabled = false);
+      }
+    };
+
+    // Toggle microphone
+    window.toggleMic = async function() {
+      if (micStream) {
+        // Stop mic
+        micStream.getTracks().forEach(t => t.stop());
+        micStream = null;
+        if (micSource) micSource.disconnect();
+        if (scriptProcessor) scriptProcessor.disconnect();
+        micBtn.textContent = 'Enable Microphone';
+        micBtn.classList.remove('active');
+        micStatus.textContent = 'Click to decode live audio';
+        return;
+      }
+
+      try {
+        // Resume audio context
+        if (audioContext.state === 'suspended') {
+          await audioContext.resume();
+        }
+
+        // Get mic access
+        micStream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            sampleRate: 48000,
+            echoCancellation: false,
+            noiseSuppression: false,
+            autoGainControl: false
+          }
+        });
+
+        micSource = audioContext.createMediaStreamSource(micStream);
+
+        // Connect to spectrogram
+        if (!spectrogram.analyser) {
+          spectrogram.connect(audioContext, micSource);
+          spectrogram.start();
+        } else {
+          micSource.connect(spectrogram.analyser);
+        }
+
+        // Create processor for decoding
+        scriptProcessor = audioContext.createScriptProcessor(4096, 1, 1);
+        micSource.connect(scriptProcessor);
+        scriptProcessor.connect(audioContext.destination);
+
+        scriptProcessor.onaudioprocess = (e) => {
+          const samples = e.inputBuffer.getChannelData(0);
+          processAudio(new Float32Array(samples));
+        };
+
+        micBtn.textContent = 'Disable Microphone';
+        micBtn.classList.add('active');
+        micStatus.textContent = 'Listening for signal...';
+
+        clearOutput();
+        decoder.reset();
+
+      } catch (err) {
+        console.error('Microphone access denied:', err);
+        micStatus.textContent = 'Microphone access denied';
+      }
+    };
+
+    // Initialize on load
+    initialize().catch(console.error);
+  </script>
+</body>
+</html>

@@ -3,7 +3,7 @@
 //! Each symbol carries 2 bits via vowel identity (F2 formant position).
 //! Pitch (F0) carries NO data — the encoder plays a melody (see
 //! `protocol::MELODY`) and the primary detection path is F0-agnostic,
-//! so pitch distortion can never corrupt data.
+//! so the receiver does not need to know the melody.
 //!
 //! - Vowel (2 bits): F2 formant position in the 1000-2500 Hz band
 //! - Pitch: free aesthetic channel, D lydian arpeggio
@@ -103,6 +103,12 @@ pub fn synthesize_symbol(vowel_idx: usize, f0: f64, volume: f64, pos: usize) -> 
     let vowel = &VOWELS[vowel_idx];
     let amps = harmonic_amplitudes(vowel.f1, vowel.f2, f0);
 
+    // These ramps are timing infrastructure, not styling: the streaming
+    // clock tracker probes guard-adjacent energy within ~2.5 ms of each
+    // boundary, and BOTH edge gradients are its signal. Measured: a 13 ms
+    // attack fails positive-offset correction detection and a 10 ms
+    // release fails the negative side (stream_clock_corrections test).
+    // Soften the sound via vibrato depth and HF rolloff instead.
     let attack_samples = (SAMPLE_RATE * 0.010) as usize; // 10 ms
     let release_samples = (SAMPLE_RATE * 0.008) as usize; // 8 ms, ends at voiced edge
     let mut out = vec![0.0f64; SYMBOL_TOTAL_SAMPLES];
@@ -111,7 +117,12 @@ pub fn synthesize_symbol(vowel_idx: usize, f0: f64, volume: f64, pos: usize) -> 
     let t_slot = (pos * SYMBOL_TOTAL_SAMPLES) as f64 / SAMPLE_RATE;
 
     // First pass: synthesize with per-harmonic phase integration so vibrato
-    // modulates frequency without phase jumps.
+    // modulates frequency without phase jumps. Harmonic phases start
+    // aligned at zero. Schroeder-style phase dispersal sounds less buzzy
+    // and was tried, but the echo clock estimator correlates the smoothed
+    // power envelope, and dispersal weakens the pitch-rate envelope
+    // structure it depends on (measured: echo_clock_recovery_preserves_
+    // the_next_melody fails with dispersed phases). Do not disperse.
     let mut phases = [0.0f64; NUM_HARMONICS];
     for i in 0..SYMBOL_TOTAL_SAMPLES {
         let t_global = t_slot + i as f64 / SAMPLE_RATE;
@@ -207,8 +218,8 @@ pub fn detect_f0(spectrum: &[f32]) -> f64 {
 /// Detect F2 formant frequency by finding spectral centroid in F2 band.
 ///
 /// Uses weighted centroid of spectral power in F2 band (1000-2500 Hz).
-/// With wide formant bandwidth (BW2=300 Hz), energy spreads across harmonics,
-/// making centroid stable across different F0 values.
+/// Energy spreads across harmonics within the F2 envelope. The template
+/// and adaptive-centroid retries account for the remaining pitch dependence.
 pub fn detect_formants(spectrum: &[f32], _f0: f64) -> f64 {
     let bin_lo = (F2_LO / HZ_PER_BIN).ceil() as usize;
     let bin_hi = (F2_HI / HZ_PER_BIN).floor() as usize;
@@ -472,16 +483,18 @@ const EQ_FLOOR_DB: f64 = -60.0;
 
 /// Reference (transmit-side) power spectra of the pilot symbols, unit volume.
 /// Pilot symbol k is vowel PILOT[k] at melody position PREAMBLE_LEN + k.
-fn expected_pilot_spectra() -> &'static Vec<Vec<f32>> {
+fn expected_pilot_spectra(profile: EccProfile) -> &'static Vec<Vec<f32>> {
     use std::sync::OnceLock;
     static SPECTRA: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
-    SPECTRA.get_or_init(|| {
+    static LEGACY_SPECTRA: OnceLock<Vec<Vec<f32>>> = OnceLock::new();
+    let cache = if profile == EccProfile::Legacy { &LEGACY_SPECTRA } else { &SPECTRA };
+    cache.get_or_init(|| {
         PILOT
             .iter()
             .enumerate()
             .map(|(k, &vowel)| {
                 let pos = PREAMBLE_LEN + k;
-                let slot = synthesize_symbol(vowel, melody_f0(pos), 1.0, pos);
+                let slot = synthesize_symbol(vowel, pilot_f0(k, profile), 1.0, pos);
                 let voiced: Vec<f32> =
                     slot[..SAMPLES_PER_SYMBOL].iter().map(|&s| s as f32).collect();
                 let mut spectrum = vec![0.0f32; voiced.len()];
@@ -498,7 +511,12 @@ fn expected_pilot_spectra() -> &'static Vec<Vec<f32>> {
 /// Returns a multiplier vector (apply as `psd[bin] * eq[bin]`) covering the
 /// F2 band, or None when the pilot didn't yield enough usable gain samples.
 pub fn estimate_eq(measured: &[(usize, Vec<f32>)]) -> Option<Vec<f64>> {
-    let refs = expected_pilot_spectra();
+    estimate_eq_with_profile(measured, EccProfile::Standard)
+}
+
+/// Estimate EQ against the pilot melody used by the selected frame format.
+pub fn estimate_eq_with_profile(measured: &[(usize, Vec<f32>)], profile: EccProfile) -> Option<Vec<f64>> {
+    let refs = expected_pilot_spectra(profile);
     let bin_lo = (F2_LO / HZ_PER_BIN).ceil() as usize;
     let bin_hi = (F2_HI / HZ_PER_BIN).floor() as usize;
     let n_buckets = ((F2_HI - F2_LO) / EQ_BUCKET_HZ).ceil() as usize;
@@ -582,7 +600,9 @@ pub fn estimate_eq(measured: &[(usize, Vec<f32>)]) -> Option<Vec<f64>> {
     // Normalize so the strongest bucket has unity gain, then floor the
     // inversion depth to bound noise amplification.
     let g_max = smoothed.iter().cloned().fold(f64::MIN, f64::max);
-    let floor_ln = EQ_FLOOR_DB / 20.0 * std::f64::consts::LN_10;
+    // These are power ratios (received PSD / expected PSD), so dB uses
+    // 10*log10. Using 20 here silently halves the specified EQ range.
+    let floor_ln = EQ_FLOOR_DB / 10.0 * std::f64::consts::LN_10;
     let normalized: Vec<f64> = smoothed
         .iter()
         .map(|&g| (g - g_max).max(floor_ln))
@@ -682,6 +702,42 @@ fn expected_vowel_spectra() -> &'static Vec<[Vec<f32>; NUM_VOWELS]> {
     })
 }
 
+/// Fixed F2-band template amplitudes and cumulative norms. Only the
+/// observation changes between calls: recomputing thousands of template
+/// square roots per classified window wastes receiver callback time. Store
+/// all four vowels together at each bin so independent dot products can be
+/// accumulated side by side without reordering any vowel's arithmetic.
+struct NoteAmplitudeTemplates {
+    values: Vec<[f64; NUM_VOWELS]>,
+    norms: Vec<[f64; NUM_VOWELS]>,
+}
+
+fn expected_vowel_amplitudes() -> &'static Vec<NoteAmplitudeTemplates> {
+    use std::sync::OnceLock;
+    static AMPLITUDES: OnceLock<Vec<NoteAmplitudeTemplates>> = OnceLock::new();
+    AMPLITUDES.get_or_init(|| {
+        let lo = (F2_LO / HZ_PER_BIN).ceil() as usize;
+        let hi = (F2_HI / HZ_PER_BIN).floor() as usize;
+        expected_vowel_spectra().iter().map(|refs| {
+            let mut values = Vec::with_capacity(hi - lo + 1);
+            let mut norms = Vec::with_capacity(hi - lo + 1);
+            let mut norm_sq = [0.0f64; NUM_VOWELS];
+            for bin in lo..=hi {
+                let amplitudes: [f64; NUM_VOWELS] =
+                    std::array::from_fn(|v| (refs[v][bin] as f64).max(0.0).sqrt());
+                for v in 0..NUM_VOWELS {
+                    norm_sq[v] += amplitudes[v] * amplitudes[v];
+                }
+                values.push(amplitudes);
+                // Every lane retains the original increasing-bin sum,
+                // including each partial-band norm.
+                norms.push(norm_sq.map(f64::sqrt));
+            }
+            NoteAmplitudeTemplates { values, norms }
+        }).collect()
+    })
+}
+
 /// Expected F2-band centroids per (note, vowel) — what the synthesis model
 /// actually produces at each F0. The static EXPECTED_F2_CENTROIDS are an
 /// average over the default melody; per-note tables remove the residual
@@ -773,7 +829,7 @@ pub fn classify_symbol_f0_adaptive(spectrum: &[f32], eq: &[f64]) -> SymbolClass 
 /// the sender may be playing an expressive track the receiver has never
 /// heard of). `eq` is the channel EQ (pass all-ones when unknown).
 pub fn classify_symbol_template(spectrum: &[f32], eq: &[f64]) -> SymbolClass {
-    let bank = expected_vowel_spectra();
+    let bank = expected_vowel_amplitudes();
     let bin_lo = (F2_LO / HZ_PER_BIN).ceil() as usize;
     let bin_hi = ((F2_HI / HZ_PER_BIN).floor() as usize)
         .min(spectrum.len().saturating_sub(1))
@@ -800,18 +856,11 @@ pub fn classify_symbol_template(spectrum: &[f32], eq: &[f64]) -> SymbolClass {
     // Per vowel: the best correlation across all candidate notes.
     let mut scores = [0.0f64; NUM_VOWELS];
     for refs in bank {
+        let dots = template_dots(&es, &refs.values);
         for (v, score) in scores.iter_mut().enumerate() {
-            let t = &refs[v];
-            let mut dot = 0.0f64;
-            let mut t_norm_sq = 0.0f64;
-            for (k, b) in (bin_lo..=bin_hi).enumerate() {
-                let tv = (t[b] as f64).max(0.0).sqrt();
-                dot += es[k] * tv;
-                t_norm_sq += tv * tv;
-            }
-            let denom = es_norm * t_norm_sq.sqrt();
+            let denom = es_norm * refs.norms[bin_hi - bin_lo][v];
             if denom > 0.0 {
-                *score = score.max(dot / denom);
+                *score = score.max(dots[v] / denom);
             }
         }
     }
@@ -840,6 +889,99 @@ pub fn classify_symbol_template(spectrum: &[f32], eq: &[f64]) -> SymbolClass {
         confidence,
         centroid,
     }
+}
+
+/// Number of notes in the template bank (chromatic B2..F#4).
+pub(crate) const BANK_NOTE_COUNT: usize = TEMPLATE_NOTES.len();
+
+/// Nearest template-bank index for a synthesis frequency (log-distance).
+pub(crate) fn bank_note_index(hz: f64) -> usize {
+    let mut best = 0;
+    let mut best_dist = f64::MAX;
+    for (idx, &note) in TEMPLATE_NOTES.iter().enumerate() {
+        let dist = (hz / note).ln().abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best = idx;
+        }
+    }
+    best
+}
+
+/// Per-note melody evidence: for each bank note, the best normalized
+/// template correlation across the four vowels over the F2 band. Cosine
+/// normalization cancels channel gain. This feeds the decoder's
+/// melody-derived LENGTH hint only — vowel decisions never consult it,
+/// and pitch still carries no data.
+pub(crate) fn note_match_scores(spectrum: &[f32]) -> [f64; BANK_NOTE_COUNT] {
+    let bank = expected_vowel_amplitudes();
+    let bin_lo = (F2_LO / HZ_PER_BIN).ceil() as usize;
+    let bin_hi = ((F2_HI / HZ_PER_BIN).floor() as usize).min(spectrum.len().saturating_sub(1));
+    let mut out = [0.0f64; BANK_NOTE_COUNT];
+    if bin_lo >= bin_hi {
+        return out;
+    }
+    let es: Vec<f64> = (bin_lo..=bin_hi)
+        .map(|b| (spectrum[b] as f64).max(0.0).sqrt())
+        .collect();
+    let es_norm = es.iter().map(|x| x * x).sum::<f64>().sqrt();
+    if es_norm <= 0.0 {
+        return out;
+    }
+    for (score, refs) in out.iter_mut().zip(bank) {
+        let dots = template_dots(&es, &refs.values);
+        for (v, &dot) in dots.iter().enumerate() {
+            let denom = es_norm * refs.norms[bin_hi - bin_lo][v];
+            if denom > 0.0 {
+                *score = score.max(dot / denom);
+            }
+        }
+    }
+    out
+}
+
+// Vectorize across independent vowels, never across the frequency-bin sum.
+// Separate multiply and add operations preserve the scalar rounding order;
+// fused multiply-add or a horizontal reduction would change confidences.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline]
+fn template_dots(observed: &[f64], templates: &[[f64; NUM_VOWELS]]) -> [f64; NUM_VOWELS] {
+    use std::arch::aarch64::{vaddq_f64, vdupq_n_f64, vld1q_f64, vmulq_f64, vst1q_f64};
+    const _: () = assert!(NUM_VOWELS == 4);
+    let mut dots = [0.0; NUM_VOWELS];
+    // SAFETY: the cfg requires NEON support. Each input row and the output
+    // contain four f64s, making both two-lane loads/stores valid. Iterating
+    // with zip limits observation access to the common slice length.
+    unsafe {
+        let mut low = vdupq_n_f64(0.0);
+        let mut high = vdupq_n_f64(0.0);
+        for (&value, row) in observed.iter().zip(templates) {
+            let value = vdupq_n_f64(value);
+            low = vaddq_f64(low, vmulq_f64(value, vld1q_f64(row.as_ptr())));
+            high = vaddq_f64(high, vmulq_f64(value, vld1q_f64(row.as_ptr().add(2))));
+        }
+        vst1q_f64(dots.as_mut_ptr(), low);
+        vst1q_f64(dots.as_mut_ptr().add(2), high);
+    }
+    dots
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+#[inline]
+fn template_dots(observed: &[f64], templates: &[[f64; NUM_VOWELS]]) -> [f64; NUM_VOWELS] {
+    template_dots_portable(observed, templates)
+}
+
+#[cfg(any(test, not(all(target_arch = "aarch64", target_feature = "neon"))))]
+#[inline]
+fn template_dots_portable(observed: &[f64], templates: &[[f64; NUM_VOWELS]]) -> [f64; NUM_VOWELS] {
+    let mut dots = [0.0; NUM_VOWELS];
+    for (&value, row) in observed.iter().zip(templates) {
+        for v in 0..NUM_VOWELS {
+            dots[v] += value * row[v];
+        }
+    }
+    dots
 }
 
 // --- 2-bit packing ---
@@ -899,6 +1041,196 @@ pub fn symbols_for_bytes(n_bytes: usize) -> usize {
 mod tests {
     use super::*;
 
+    // Reference matcher retains the original per-call template square
+    // roots, norm accumulation, score ordering, and confidence calculation.
+    fn uncached_template_classifier(spectrum: &[f32], eq: &[f64]) -> SymbolClass {
+        let bank = expected_vowel_spectra();
+        let lo = (F2_LO / HZ_PER_BIN).ceil() as usize;
+        let hi = ((F2_HI / HZ_PER_BIN).floor() as usize)
+            .min(spectrum.len().saturating_sub(1)).min(eq.len().saturating_sub(1));
+        let centroid = detect_formants_eq(spectrum, eq);
+        if lo >= hi {
+            let (vowel, second, confidence) = classify_vowel_f2_ranked(centroid, &EXPECTED_F2_CENTROIDS);
+            return SymbolClass { vowel, second, confidence: normalize_confidence(confidence), centroid };
+        }
+        let observation: Vec<f64> = (lo..=hi)
+            .map(|b| (spectrum[b] as f64 * eq[b]).max(0.0).sqrt()).collect();
+        let norm = observation.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let mut scores = [0.0f64; NUM_VOWELS];
+        for refs in bank {
+            for (v, score) in scores.iter_mut().enumerate() {
+                let mut dot = 0.0;
+                let mut template_norm_sq = 0.0;
+                for (k, b) in (lo..=hi).enumerate() {
+                    let amplitude = (refs[v][b] as f64).max(0.0).sqrt();
+                    dot += observation[k] * amplitude;
+                    template_norm_sq += amplitude * amplitude;
+                }
+                let denominator = norm * template_norm_sq.sqrt();
+                if denominator > 0.0 { *score = score.max(dot / denominator); }
+            }
+        }
+        let (mut vowel, mut second) = (0, 0);
+        let (mut first_score, mut second_score) = (f64::MIN, f64::MIN);
+        for (v, &score) in scores.iter().enumerate() {
+            if score > first_score {
+                second_score = first_score;
+                second = vowel;
+                first_score = score;
+                vowel = v;
+            } else if score > second_score {
+                second_score = score;
+                second = v;
+            }
+        }
+        SymbolClass { vowel, second, centroid,
+            confidence: ((first_score - second_score) / (1.0 - second_score).max(1e-9)).clamp(0.0, 1.0) }
+    }
+
+    fn assert_same_class(actual: SymbolClass, expected: SymbolClass) {
+        assert_eq!(actual.vowel, expected.vowel);
+        assert_eq!(actual.second, expected.second);
+        assert_eq!(actual.confidence.to_bits(), expected.confidence.to_bits());
+        assert_eq!(actual.centroid.to_bits(), expected.centroid.to_bits());
+    }
+
+    #[test]
+    fn template_dots_preserve_native_and_portable_arithmetic_order() {
+        for kind in 0..4 {
+            let observed: Vec<f64> = (0..160).map(|i| match kind {
+                0 => 0.0,
+                1 => (i as f64 + 1.0) / 37.0,
+                // Cancellation exposes accidental reordering or fused
+                // arithmetic that ordinary positive spectra could miss.
+                2 => [1e16, 1.0, -1e16, -1.0, 0.125][i % 5],
+                _ => [1e-100, 1e100, -1e-100, -1e100, 1.0][i % 5],
+            }).collect();
+            let templates: Vec<[f64; NUM_VOWELS]> = (0..160).map(|i| {
+                std::array::from_fn(|v| [0.0, -0.0, 0.1, -0.3, 1.0000000000000002][(i + v) % 5])
+            }).collect();
+            for observed_len in [0, 1, 2, 3, 7, 8, 9, 31, 75, 76, 77, 155] {
+                for template_len in [0, 1, 7, 8, 9, 76, 155] {
+                    let observed = &observed[..observed_len];
+                    let templates = &templates[..template_len];
+                    let expected: [f64; NUM_VOWELS] = std::array::from_fn(|v| {
+                        observed.iter().zip(templates).fold(0.0, |dot, (&value, row)| dot + value * row[v])
+                    });
+                    assert_eq!(template_dots(observed, templates).map(f64::to_bits), expected.map(f64::to_bits));
+                    assert_eq!(template_dots_portable(observed, templates).map(f64::to_bits), expected.map(f64::to_bits));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_templates_preserve_every_amplitude_and_prefix_norm() {
+        let lo = (F2_LO / HZ_PER_BIN).ceil() as usize;
+        let hi = (F2_HI / HZ_PER_BIN).floor() as usize;
+        let bank = expected_vowel_amplitudes();
+        assert_eq!(bank.len(), TEMPLATE_NOTES.len());
+        for (note, spectra) in expected_vowel_spectra().iter().enumerate() {
+            assert_eq!(bank[note].values.len(), hi - lo + 1);
+            assert_eq!(bank[note].norms.len(), hi - lo + 1);
+            for v in 0..NUM_VOWELS {
+                let mut norm_sq = 0.0f64;
+                for bin in lo..=hi {
+                    let amplitude = (spectra[v][bin] as f64).max(0.0).sqrt();
+                    norm_sq += amplitude * amplitude;
+                    assert_eq!(bank[note].values[bin - lo][v].to_bits(), amplitude.to_bits());
+                    assert_eq!(bank[note].norms[bin - lo][v].to_bits(), norm_sq.sqrt().to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interleaved_templates_preserve_mixtures_and_every_partial_band() {
+        let bank = expected_vowel_spectra();
+        let hi = (F2_HI / HZ_PER_BIN).floor() as usize;
+        let flat_eq = vec![1.0; FFT_SIZE];
+        // Exercise each partial spectrum and EQ boundary, not only the
+        // complete band used by normal decoding. Silence also tests ties.
+        for length in 0..=hi + 2 {
+            for vowel in 0..NUM_VOWELS {
+                let spectrum = &bank[7][vowel][..length];
+                assert_same_class(classify_symbol_template(spectrum, &flat_eq),
+                    uncached_template_classifier(spectrum, &flat_eq));
+                if length > 0 {
+                    assert_same_class(classify_symbol_template(&bank[7][vowel], &flat_eq[..length]),
+                        uncached_template_classifier(&bank[7][vowel], &flat_eq[..length]));
+                }
+            }
+            let silence = vec![0.0; length];
+            assert_same_class(classify_symbol_template(&silence, &flat_eq),
+                uncached_template_classifier(&silence, &flat_eq));
+        }
+        // Competing notes/vowels and almost-equal blends stress ranking,
+        // runner-up selection, and confidence near decision boundaries.
+        for note in 0..TEMPLATE_NOTES.len() {
+            for vowel in 0..NUM_VOWELS {
+                for weight in [0.001, 0.25, 0.4999, 0.5, 0.5001, 0.75, 0.999] {
+                    let spectrum: Vec<f32> = bank[note][vowel].iter()
+                        .zip(&bank[(note + 7) % bank.len()][(vowel + 1) % NUM_VOWELS])
+                        .map(|(&a, &b)| ((1.0 - weight) * a as f64 + weight * b as f64) as f32)
+                        .collect();
+                    for tilt in [-50.0, 0.0, 40.0] {
+                        let eq: Vec<f64> = (0..FFT_SIZE).map(|bin| {
+                            let t = ((bin as f64 * HZ_PER_BIN - F2_LO) / (F2_HI - F2_LO)).clamp(0.0, 1.0);
+                            10.0f64.powf(tilt * t / 10.0)
+                        }).collect();
+                        assert_same_class(classify_symbol_template(&spectrum, &eq),
+                            uncached_template_classifier(&spectrum, &eq));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_templates_preserve_all_classification_fields_bit_for_bit() {
+        for midi in 47..=66 {
+            for detune in [-0.3, 0.0, 0.3] {
+                let hz = 440.0 * 2.0f64.powf((midi as f64 + detune - 69.0) / 12.0);
+                for vowel in 0..NUM_VOWELS {
+                    let slot = synthesize_symbol(vowel, hz, 0.5, midi as usize);
+                    let voiced: Vec<f32> = slot[..SAMPLES_PER_SYMBOL].iter().map(|&x| x as f32).collect();
+                    let mut spectrum = vec![0.0; voiced.len()];
+                    crate::fft::power_spectrum(&voiced, &mut spectrum);
+                    for tilt in [-50.0, 0.0, 40.0] {
+                        let eq: Vec<f64> = (0..spectrum.len()).map(|bin| {
+                            let t = ((bin as f64 * HZ_PER_BIN - F2_LO) / (F2_HI - F2_LO)).clamp(0.0, 1.0);
+                            10.0f64.powf(tilt * t / 10.0)
+                        }).collect();
+                        assert_same_class(classify_symbol_template(&spectrum, &eq),
+                            uncached_template_classifier(&spectrum, &eq));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cached_templates_preserve_partial_bands_silence_and_interference() {
+        let mut state = 18573u32;
+        for spectrum_len in [0, 1, 50, 51, 70, 125, 126, FFT_SIZE] {
+            for eq_len in [1, 50, 51, 70, 125, 126, FFT_SIZE] {
+                for kind in 0..3 {
+                    let spectrum: Vec<f32> = (0..spectrum_len).map(|bin| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match kind {
+                            0 => 0.0,
+                            1 => (state as f64 / u32::MAX as f64) as f32,
+                            _ => if bin % 7 == 0 { 100.0 } else { 0.001 },
+                        }
+                    }).collect();
+                    let eq: Vec<f64> = (0..eq_len).map(|bin| 10.0f64.powf((bin % 9) as f64 - 4.0)).collect();
+                    assert_same_class(classify_symbol_template(&spectrum, &eq),
+                        uncached_template_classifier(&spectrum, &eq));
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_bit_packing_roundtrip() {
         for len in 1..=20 {
@@ -927,6 +1259,29 @@ mod tests {
                 F0_CANDIDATES.iter().any(|&c| (c - f0).abs() < 0.01),
                 "melody note {f0} missing from F0_CANDIDATES"
             );
+        }
+    }
+
+    #[test]
+    fn test_eq_recovers_large_power_tilt() {
+        let attenuate = |psd: &[f32]| -> Vec<f32> {
+            psd.iter().enumerate().map(|(bin, &power)| {
+                let freq = bin as f64 * HZ_PER_BIN;
+                let db = -50.0 * ((F2_HI - freq) / (F2_HI - F2_LO)).clamp(0.0, 1.0);
+                power * 10.0f64.powf(db / 10.0) as f32
+            }).collect()
+        };
+        let measured: Vec<_> = expected_pilot_spectra(EccProfile::Standard).iter().enumerate()
+            .map(|(i, psd)| (i, attenuate(psd))).collect();
+        let eq = estimate_eq(&measured).unwrap();
+        assert!(eq[52] / eq[121] > 10_000.0, "50 dB power tilt must not clip at 30 dB");
+        for (note, spectra) in expected_vowel_spectra().iter().enumerate() {
+            for (vowel, spectrum) in spectra.iter().enumerate() {
+                let expected = detect_formants(spectrum, 0.0);
+                let recovered = detect_formants_eq(&attenuate(spectrum), &eq);
+                assert!((recovered - expected).abs() < 65.0,
+                    "note {note}, vowel {vowel}: centroid {expected:.1} recovered as {recovered:.1}");
+            }
         }
     }
 

@@ -27,12 +27,44 @@ fn data_start_sample() -> usize {
 }
 
 #[test]
+fn empty_transfers_are_rejected_before_checksum_framing() {
+    assert!(matches!(transfer::encode(&[], 50), Err(song_rs::Error::EmptyPayload)));
+    for copies in [0, 1, 3] {
+        assert!(matches!(transfer::encode_repeated(&[], 50, copies, 180),
+            Err(song_rs::Error::EmptyPayload)), "copies {copies}");
+    }
+}
+
+#[test]
 fn test_transfer_roundtrip_clean() {
     let key = b"sk-live-4242deadbeefCAFEBABE0123456789";
     let audio = transfer::encode(key, 50).unwrap();
     let mut rx = TransferRx::new();
     let got = rx.ingest(&audio).expect("clean transfer failed");
     assert_eq!(got, key);
+}
+
+#[test]
+fn test_continuous_transfers_preserve_audio_buffered_after_delivery() {
+    let payloads = [b"first".as_slice(), b"a longer second melody".as_slice(), b"first".as_slice()];
+    let mut audio = Vec::new();
+    for payload in payloads {
+        audio.extend(transfer::encode(payload, 50).unwrap());
+        audio.extend(vec![0.0; 10 * SYMBOL_TOTAL_SAMPLES]);
+    }
+    for chunk_size in [437, 2048, audio.len()] {
+        let mut rx = TransferRx::new();
+        let mut deliveries = Vec::new();
+        for chunk in audio.chunks(chunk_size) {
+            if let Some(bytes) = rx.ingest(chunk) { deliveries.push(bytes); }
+            // A single callback may contain several complete transmissions.
+            // Retiring votes must not reset the decoder or discard its tail.
+            while let Some(bytes) = rx.ingest(&[]) { deliveries.push(bytes); }
+        }
+        assert_eq!(deliveries, payloads.iter().map(|bytes| bytes.to_vec()).collect::<Vec<_>>());
+        assert_eq!(rx.attempts(), 0);
+        assert!(!rx.is_locked());
+    }
 }
 
 #[test]
@@ -71,15 +103,8 @@ fn test_paranoid_survives_what_standard_cannot() {
     // profile's reach (~40% parity: hard radius plus erasure/Chase
     // assistance tops out near 25%), within the paranoid profile's ~50%.
     let key = b"paranoid profile survival test 123";
-    let framed_len = key.len() + 4; // + CRC
-
-    // Standard profile, same framing, same corruption
-    let std_audio = song_rs::encode(&{
-        let mut f = key.to_vec();
-        f.extend_from_slice(&transfer::crc32(key).to_le_bytes());
-        f
-    }, 50)
-    .unwrap();
+    // Both profiles protect exactly key + CRC, with the same armored melody.
+    let std_audio = song_rs::encode_armored(key, 50).unwrap();
     let par_audio = transfer::encode(key, 50).unwrap();
 
     // Corrupt the same fraction of each data region
@@ -94,10 +119,13 @@ fn test_paranoid_survives_what_standard_cannot() {
     corrupt_range(&mut par_bad, ds, par_len, 7);
 
     let mut std_dec = song_rs::Decoder::new();
-    let std_ok = matches!(
-        std_dec.decode(&std_bad),
-        Ok(Some(ref d)) if d.len() == framed_len
-    );
+    let std_ok = match std_dec.decode(&std_bad) {
+        Ok(Some(got)) => {
+            assert_eq!(got, key, "standard profile returned a wrong payload");
+            true
+        }
+        _ => false,
+    };
     assert!(!std_ok, "standard profile unexpectedly survived 30% corruption");
 
     let mut rx = TransferRx::new();

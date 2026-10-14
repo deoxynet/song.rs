@@ -1,10 +1,9 @@
 //! Giant Steps as a carrier melody: pitch carries no data, so the encoder
 //! may sing Coltrane while the vowels carry the payload.
 //!
-//! The head is octave-folded into the modem's register (~D3..C#4). The
-//! default melody notes are margin-verified for reverb-comb safety; Giant
-//! Steps needs ten pitch classes, so this example VERIFIES the result
-//! end-to-end through the nasty channels instead of trusting the register.
+//! The head is transposed into B2–F#4 with its contour preserved. This
+//! example verifies the complete tune through six channels, including
+//! spectral tilt followed by neural noise suppression.
 //!
 //! Usage: cargo run --release --example giant_steps [output_dir]
 
@@ -232,23 +231,15 @@ fn main() {
 
     for (name, ch_audio) in &channels {
         let ok = verify(ch_audio, &msg);
-        let expected = *name != "teams_full_pipeline";
         println!(
-            "  {:<22} {}{}",
+            "  {:<22} {}",
             name,
             if ok { "decodes OK" } else { "NO DECODE" },
-            if ok == expected { "" } else { "  (UNEXPECTED)" }
         );
+        assert!(ok, "Giant Steps failed through {name}");
         if *name == "clean" || *name == "teams_full_pipeline" {
             write_wav(&format!("{dir}/giant_steps_{name}.wav"), ch_audio);
         }
     }
     write_wav(&format!("{dir}/giant_steps.wav"), &audio);
-    // The worst-case pipeline (40 dB tilt + RNNoise) measurably DESTROYS
-    // certain (note, vowel) windows — every classifier rung fails on the
-    // same ~7% of symbols, so this is channel information loss, not decoder
-    // slack. That channel is exactly why the DEFAULT melody restricts
-    // itself to the margin-verified D lydian notes; expressive tracks trade
-    // the last channel for the tune.
-    println!("(teams_full_pipeline is expected to fail: see comment in main)");
 }

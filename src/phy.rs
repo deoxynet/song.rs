@@ -72,7 +72,8 @@ impl std::error::Error for PhyError {}
 
 /// PHY layer configuration.
 pub struct PhyConfig {
-    /// ACK timeout in milliseconds (default: 4000).
+    /// ACK timeout after DATA transmission, in milliseconds (default: 6000).
+    /// Includes the ACK's 3.84 s airtime; leave room for round-trip channel latency.
     pub timeout_ms: u32,
     /// Maximum retransmission attempts per fragment (default: 5).
     pub max_retries: u8,
@@ -83,7 +84,7 @@ pub struct PhyConfig {
 impl Default for PhyConfig {
     fn default() -> Self {
         Self {
-            timeout_ms: 4000,
+            timeout_ms: 6000,
             max_retries: 5,
             volume: 50,
         }

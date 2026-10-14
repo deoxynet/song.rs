@@ -1,4 +1,9 @@
 /target
 wasm/target
 web/pkg
+web/pkg-worker
 web/node_modules
+demo/pkg
+*.mp4
+*.wav
+*.pptx

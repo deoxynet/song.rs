@@ -5,10 +5,10 @@ const PAYLOAD_SIZES: &[usize] = &[1, 5, 10, 25, 50, 100, 140];
 
 /// Compute the over-the-air duration for a given payload size.
 fn audio_duration_secs(payload_len: usize) -> f64 {
-    let n_ecc = protocol::ecc_bytes_for_length(payload_len);
-    let total_bytes = protocol::ENCODED_DATA_OFFSET + payload_len + n_ecc;
+    let total_bytes = protocol::EccProfile::Standard.encoded_bytes(payload_len);
     let n_data_symbols = formant::symbols_for_bytes(total_bytes);
-    let total_symbols = protocol::PREAMBLE_LEN + n_data_symbols + protocol::PREAMBLE_LEN;
+    let total_symbols = protocol::PREAMBLE_LEN + protocol::PILOT_LEN
+        + n_data_symbols + protocol::PREAMBLE_LEN;
     let total_samples = total_symbols * protocol::SYMBOL_TOTAL_SAMPLES;
     total_samples as f64 / protocol::SAMPLE_RATE
 }
@@ -16,7 +16,7 @@ fn audio_duration_secs(payload_len: usize) -> f64 {
 /// Print the protocol bandwidth table once before benchmarks run.
 fn print_protocol_table() {
     println!();
-    println!("=== Protocol Bandwidth (2-Channel Vocal Modem @ 48 kHz, 4 bit/sym) ===");
+    println!("=== Protocol Bandwidth (CRC-protected Vowel Modem, 2 bit/sym) ===");
     println!(
         "{:>7} {:>5} {:>8} {:>10} {:>8} {:>12}",
         "Payload", "ECC", "Symbols", "Samples", "Duration", "Bitrate"
@@ -27,10 +27,11 @@ fn print_protocol_table() {
     );
     println!("{}", "-".repeat(58));
     for &size in PAYLOAD_SIZES {
-        let n_ecc = protocol::ecc_bytes_for_length(size);
-        let total_bytes = protocol::ENCODED_DATA_OFFSET + size + n_ecc;
+        let n_ecc = protocol::EccProfile::Standard.ecc_bytes(size);
+        let total_bytes = protocol::EccProfile::Standard.encoded_bytes(size);
         let n_data_symbols = formant::symbols_for_bytes(total_bytes);
-        let total_symbols = protocol::PREAMBLE_LEN + n_data_symbols + protocol::PREAMBLE_LEN;
+        let total_symbols = protocol::PREAMBLE_LEN + protocol::PILOT_LEN
+            + n_data_symbols + protocol::PREAMBLE_LEN;
         let total_samples = total_symbols * protocol::SYMBOL_TOTAL_SAMPLES;
         let duration = total_samples as f64 / protocol::SAMPLE_RATE;
         let payload_bits = size * 8;

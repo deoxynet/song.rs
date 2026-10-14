@@ -40,6 +40,8 @@ export class AudioEngine {
     this.tx = null;
     this.rx = null;
     this.workletLoaded = false;
+    this.workletLoading = null;
+    this.rxGeneration = 0;
     this.level = { fill: 0, zone: 'quiet', peak: 0 };
   }
 
@@ -187,6 +189,8 @@ export class AudioEngine {
   // ---- RX ----------------------------------------------------------------
 
   async startRx({ onChunk }) {
+    this.stopRx();
+    const generation = this.rxGeneration;
     const ctx = this.ensureCtx();
     // Even after a user gesture, some engines can hold resume() while the
     // permission sheet is open. Don't await it here; the app watches the
@@ -204,10 +208,16 @@ export class AudioEngine {
     let srcNode;
     let node;
     try {
+      if (generation !== this.rxGeneration) throw new DOMException('Capture cancelled', 'AbortError');
       if (!this.workletLoaded) {
-        await ctx.audioWorklet.addModule(new URL('./worklet.js', import.meta.url));
-        this.workletLoaded = true;
+        if (!this.workletLoading) {
+          this.workletLoading = ctx.audioWorklet.addModule(new URL('./worklet.js', import.meta.url))
+            .then(() => { this.workletLoaded = true; })
+            .finally(() => { this.workletLoading = null; });
+        }
+        await this.workletLoading;
       }
+      if (generation !== this.rxGeneration) throw new DOMException('Capture cancelled', 'AbortError');
       srcNode = ctx.createMediaStreamSource(stream);
       node = new AudioWorkletNode(ctx, 'akt-capture', {
         numberOfInputs: 1,
@@ -226,6 +236,7 @@ export class AudioEngine {
       ? new LinearResampler(ctx.sampleRate, TARGET_RATE)
       : null;
     node.port.onmessage = (e) => {
+      if (generation !== this.rxGeneration) return;
       let chunk = e.data;
       this._updateLevel(chunk);
       if (resampler) chunk = resampler.process(chunk);
@@ -236,6 +247,7 @@ export class AudioEngine {
   }
 
   stopRx() {
+    this.rxGeneration += 1;
     const rx = this.rx;
     if (!rx) return;
     rx.node.port.onmessage = null;

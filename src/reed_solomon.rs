@@ -2,6 +2,8 @@
 //!
 //! Ported from ggwave's `src/reed-solomon/` for bit-compatibility.
 
+use std::sync::OnceLock;
+
 /// GF(2^8) exponential table (512 entries, wraps around at 255).
 #[rustfmt::skip]
 const GF_EXP: [u8; 512] = [
@@ -65,11 +67,9 @@ const GF_LOG: [u8; 256] = [
 
 #[inline]
 fn gf_mul(x: u8, y: u8) -> u8 {
-    if x == 0 || y == 0 {
-        0
-    } else {
-        GF_EXP[GF_LOG[x as usize] as usize + GF_LOG[y as usize] as usize]
-    }
+    // Polynomial loops normally keep the second operand fixed. Select its
+    // row so scaling, evaluation, and Forney updates reuse 256 adjacent bytes.
+    GF_PRODUCTS[y as usize][x as usize]
 }
 
 #[inline]
@@ -98,6 +98,7 @@ fn gf_inverse(x: u8) -> u8 {
 
 // --- Polynomial operations (dynamic Vec-based) ---
 
+#[cfg(test)]
 fn poly_scale(p: &[u8], x: u8) -> Vec<u8> {
     p.iter().map(|&c| gf_mul(c, x)).collect()
 }
@@ -161,11 +162,32 @@ fn generator_poly(ecc_length: usize) -> Vec<u8> {
 
 // --- Syndromes ---
 
+// One fixed 64 KiB table is shared by field multiplication and syndrome
+// evaluation. It replaces logarithm/exponent lookups and zero branches,
+// with no per-message allocation, cache growth, or initialization work.
+static GF_PRODUCTS: [[u8; 256]; 256] = {
+    let mut products = [[0u8; 256]; 256];
+    let mut x = 1;
+    while x < 256 {
+        let mut y = 1;
+        while y < 256 {
+            products[x][y] = GF_EXP[GF_LOG[x] as usize + GF_LOG[y] as usize];
+            y += 1;
+        }
+        x += 1;
+    }
+    products
+};
+
 fn calc_syndromes(msg: &[u8], ecc_length: usize) -> Vec<u8> {
     let mut synd = vec![0u8; ecc_length + 1];
-    synd[0] = 0;
     for i in 1..=ecc_length {
-        synd[i] = poly_eval(msg, gf_pow(2, (i - 1) as isize));
+        let products = &GF_PRODUCTS[gf_pow(2, (i - 1) as isize) as usize];
+        let mut value = msg[0];
+        for &coefficient in &msg[1..] {
+            value = products[value as usize] ^ coefficient;
+        }
+        synd[i] = value;
     }
     synd
 }
@@ -173,8 +195,12 @@ fn calc_syndromes(msg: &[u8], ecc_length: usize) -> Vec<u8> {
 // --- Error locator (Berlekamp-Massey) ---
 
 fn find_error_locator(synd: &[u8], ecc_length: usize, erase_count: usize) -> Option<Vec<u8>> {
-    let mut err_loc = vec![1u8];
-    let mut old_loc = vec![1u8];
+    // A locator grows by at most one coefficient per iteration. Reserve
+    // both work buffers once; scaling and polynomial addition stay in place.
+    let mut err_loc = Vec::with_capacity(ecc_length + 1);
+    let mut old_loc = Vec::with_capacity(ecc_length + 1);
+    err_loc.push(1u8);
+    old_loc.push(1u8);
 
     let synd_shift = if synd.len() > ecc_length {
         synd.len() - ecc_length
@@ -195,12 +221,22 @@ fn find_error_locator(synd: &[u8], ecc_length: usize, erase_count: usize) -> Opt
 
         if delta != 0 {
             if old_loc.len() > err_loc.len() {
-                let temp = poly_scale(&old_loc, delta);
-                old_loc = poly_scale(&err_loc, gf_inverse(delta));
-                err_loc = temp;
+                std::mem::swap(&mut old_loc, &mut err_loc);
+                for coefficient in &mut err_loc {
+                    *coefficient = gf_mul(*coefficient, delta);
+                }
+                let inverse = gf_inverse(delta);
+                for coefficient in &mut old_loc {
+                    *coefficient = gf_mul(*coefficient, inverse);
+                }
             }
-            let temp = poly_scale(&old_loc, delta);
-            err_loc = poly_add(&err_loc, &temp);
+            // After the possible swap, err_loc is at least as long as
+            // old_loc. This is exactly poly_add(err_loc, scale(old_loc,
+            // delta)), right-aligned as in the original implementation.
+            let offset = err_loc.len() - old_loc.len();
+            for (i, &coefficient) in old_loc.iter().enumerate() {
+                err_loc[offset + i] ^= gf_mul(coefficient, delta);
+            }
         }
     }
 
@@ -312,15 +348,9 @@ fn correct_errata(msg_in: &[u8], synd: &[u8], err_pos: &[usize]) -> Vec<u8> {
 }
 
 /// Forney syndromes for error detection after erasure removal.
-fn calc_forney_syndromes(
-    synd: &[u8],
-    erasures_pos: &[usize],
-    msg_in_size: usize,
-) -> Vec<u8> {
-    let erase_pos_reversed: Vec<usize> = erasures_pos
-        .iter()
-        .map(|&p| msg_in_size - 1 - p)
-        .collect();
+fn calc_forney_syndromes(synd: &[u8], erasures_pos: &[usize], msg_in_size: usize) -> Vec<u8> {
+    let erase_pos_reversed: Vec<usize> =
+        erasures_pos.iter().map(|&p| msg_in_size - 1 - p).collect();
 
     let mut forney_synd = synd[1..].to_vec();
 
@@ -338,17 +368,155 @@ fn calc_forney_syndromes(
 pub struct ReedSolomon {
     msg_length: usize,
     ecc_length: usize,
-    generator: Vec<u8>,
+    // Decoding does not use the generator polynomial. Build it only when
+    // encoding, rather than for every length/alignment/Chase hypothesis.
+    generator: OnceLock<Vec<u8>>,
+}
+
+/// A received codeword and its syndromes, shared by hard and erasure retries.
+/// Keeping the bytes borrowed alongside their syndromes prevents a retry
+/// from accidentally using checks calculated for a different codeword.
+pub(crate) struct PreparedBlock<'a> {
+    msg_length: usize,
+    ecc_length: usize,
+    encoded: &'a [u8],
+    syndromes: Vec<u8>,
+}
+
+/// Reuse syndrome evaluation when candidate codewords are prefixes of one
+/// immutable received body. The first request uses the ordinary calculation;
+/// only a second actual request allocates prefix rows. Failure-cache hits
+/// therefore do not trigger speculative work, and clean decoding stays cheap.
+pub(crate) struct PrefixDecoder<'a> {
+    encoded: &'a [u8],
+    max_ecc: usize,
+    first_request: bool,
+    // One row per generator root, indexed by prefix length minus one.
+    // At most 255 rows, each covering at most 255 received bytes.
+    prefixes: Vec<[u8; 255]>,
+    #[cfg(test)]
+    prefix_steps: usize,
+}
+
+/// Exact syndrome reuse across sparse changes to one immutable received body.
+/// Chase retries change at most a few bytes. Evaluate the original polynomial
+/// prefixes once, then XOR each changed coefficient's contribution at the
+/// requested codeword length. Corrected codewords still undergo the ordinary
+/// independent full syndrome verification in `PreparedBlock`.
+pub(crate) struct RetrySyndromes {
+    original: Vec<u8>,
+    prefixes: Vec<[u8; 255]>,
+    #[cfg(test)]
+    prefix_steps: usize,
+    #[cfg(test)]
+    delta_steps: usize,
+}
+
+impl RetrySyndromes {
+    pub(crate) fn new(original: &[u8]) -> Self {
+        assert!(original.len() <= 255);
+        Self {
+            original: original.to_vec(),
+            prefixes: Vec::new(),
+            #[cfg(test)]
+            prefix_steps: 0,
+            #[cfg(test)]
+            delta_steps: 0,
+        }
+    }
+
+    pub(crate) fn prepare_decode<'a>(
+        &mut self, encoded: &'a [u8], msg_length: usize, ecc_length: usize,
+    ) -> PreparedBlock<'a> {
+        assert!(msg_length <= self.original.len()
+            && ecc_length <= self.original.len() - msg_length);
+        let length = msg_length + ecc_length;
+        assert_eq!(encoded.len(), length);
+        if self.prefixes.len() < ecc_length {
+            self.prefixes.reserve_exact(ecc_length - self.prefixes.len());
+        }
+        for root in self.prefixes.len()..ecc_length {
+            let products = &GF_PRODUCTS[gf_pow(2, root as isize) as usize];
+            let mut row = [0u8; 255];
+            let mut value = 0;
+            for (prefix, &coefficient) in row.iter_mut().zip(&self.original) {
+                value = products[value as usize] ^ coefficient;
+                *prefix = value;
+                #[cfg(test)]
+                { self.prefix_steps += 1; }
+            }
+            self.prefixes.push(row);
+        }
+        let mut syndromes = vec![0; ecc_length + 1];
+        for (root, row) in self.prefixes.iter().take(ecc_length).enumerate() {
+            syndromes[root + 1] = row[length - 1];
+        }
+        for (position, (&before, &after)) in self.original.iter().zip(encoded).enumerate() {
+            let delta = before ^ after;
+            if delta == 0 { continue; }
+            let power = length - 1 - position;
+            for root in 0..ecc_length {
+                syndromes[root + 1] ^= gf_mul(delta, gf_pow(2, (root * power) as isize));
+                #[cfg(test)]
+                { self.delta_steps += 1; }
+            }
+        }
+        PreparedBlock { msg_length, ecc_length, encoded, syndromes }
+    }
+}
+
+impl<'a> PrefixDecoder<'a> {
+    pub(crate) fn new(encoded: &'a [u8], max_ecc: usize) -> Self {
+        assert!(encoded.len() <= 255 && max_ecc <= encoded.len());
+        Self {
+            encoded,
+            max_ecc,
+            first_request: true,
+            prefixes: Vec::new(),
+            #[cfg(test)]
+            prefix_steps: 0,
+        }
+    }
+
+    pub(crate) fn prepare_decode(&mut self, msg_length: usize, ecc_length: usize) -> PreparedBlock<'a> {
+        assert!(msg_length <= self.encoded.len() && ecc_length <= self.max_ecc);
+        let length = msg_length + ecc_length;
+        assert!(length <= self.encoded.len());
+        let encoded = &self.encoded[..length];
+        if self.first_request {
+            self.first_request = false;
+            return ReedSolomon::new(msg_length, ecc_length).prepare_decode(encoded);
+        }
+        if ecc_length > 0 && self.prefixes.capacity() == 0 {
+            self.prefixes.reserve_exact(self.max_ecc);
+        }
+        for root in self.prefixes.len()..ecc_length {
+            let products = &GF_PRODUCTS[gf_pow(2, root as isize) as usize];
+            let mut row = [0u8; 255];
+            let mut value = 0;
+            for (prefix, &coefficient) in row.iter_mut().zip(self.encoded) {
+                value = products[value as usize] ^ coefficient;
+                *prefix = value;
+                #[cfg(test)]
+                { self.prefix_steps += 1; }
+            }
+            self.prefixes.push(row);
+        }
+        let mut syndromes = vec![0; ecc_length + 1];
+        for (i, row) in self.prefixes.iter().take(ecc_length).enumerate() {
+            syndromes[i + 1] = row[length - 1];
+        }
+        PreparedBlock { msg_length, ecc_length, encoded, syndromes }
+    }
 }
 
 impl ReedSolomon {
     /// Create a new RS codec with the given message and ECC lengths.
     pub fn new(msg_length: usize, ecc_length: usize) -> Self {
-        let generator = generator_poly(ecc_length);
         Self {
             msg_length,
             ecc_length,
-            generator,
+            generator: OnceLock::new(),
         }
     }
 
@@ -358,14 +526,17 @@ impl ReedSolomon {
         assert_eq!(msg.len(), self.msg_length);
         assert!(self.msg_length + self.ecc_length < 256);
 
+        let generator = self
+            .generator
+            .get_or_init(|| generator_poly(self.ecc_length));
         let mut msg_out = vec![0u8; self.msg_length + self.ecc_length];
         msg_out[..self.msg_length].copy_from_slice(msg);
 
         for i in 0..self.msg_length {
             let coef = msg_out[i];
             if coef != 0 {
-                for j in 1..self.generator.len() {
-                    msg_out[i + j] ^= gf_mul(self.generator[j], coef);
+                for j in 1..generator.len() {
+                    msg_out[i + j] ^= gf_mul(generator[j], coef);
                 }
             }
         }
@@ -396,12 +567,34 @@ impl ReedSolomon {
     /// erasure positions lets RS correct more total damage.
     /// Returns `None` if correction fails.
     pub fn decode_with_erasures(&self, encoded: &[u8], erase_pos: &[usize]) -> Option<Vec<u8>> {
+        self.prepare_decode(encoded).decode_with_erasures(erase_pos)
+    }
+
+    pub(crate) fn prepare_decode<'a>(&self, encoded: &'a [u8]) -> PreparedBlock<'a> {
         assert_eq!(encoded.len(), self.msg_length + self.ecc_length);
+        PreparedBlock {
+            msg_length: self.msg_length,
+            ecc_length: self.ecc_length,
+            encoded,
+            syndromes: calc_syndromes(encoded, self.ecc_length),
+        }
+    }
 
+    /// Decode block: takes separate message and ecc slices.
+    /// Returns decoded message or None if correction fails.
+    pub fn decode_block(&self, msg: &[u8], ecc: &[u8]) -> Option<Vec<u8>> {
+        let mut encoded = Vec::with_capacity(self.msg_length + self.ecc_length);
+        encoded.extend_from_slice(msg);
+        encoded.extend_from_slice(ecc);
+        self.decode(&encoded)
+    }
+}
+
+impl PreparedBlock<'_> {
+    pub(crate) fn decode_with_erasures(&self, erase_pos: &[usize]) -> Option<Vec<u8>> {
+        let encoded = self.encoded;
         let src_len = self.msg_length + self.ecc_length;
-
-        // Calculate syndromes
-        let synd = calc_syndromes(encoded, self.ecc_length);
+        let synd = &self.syndromes;
 
         // Check for errors
         let has_errors = synd.iter().any(|&s| s != 0);
@@ -415,7 +608,7 @@ impl ReedSolomon {
         }
 
         // Use Forney syndromes to find additional errors beyond known erasures
-        let forney = calc_forney_syndromes(&synd, erase_pos, src_len);
+        let forney = calc_forney_syndromes(synd, erase_pos, src_len);
 
         let error_loc = find_error_locator(&forney, self.ecc_length, erase_pos.len())?;
 
@@ -432,7 +625,7 @@ impl ReedSolomon {
             return None;
         }
 
-        let corrected = correct_errata(encoded, &synd, &all_pos);
+        let corrected = correct_errata(encoded, synd, &all_pos);
 
         // Verify correction
         let verify_synd = calc_syndromes(&corrected, self.ecc_length);
@@ -442,20 +635,457 @@ impl ReedSolomon {
 
         Some(corrected[..self.msg_length].to_vec())
     }
-
-    /// Decode block: takes separate message and ecc slices.
-    /// Returns decoded message or None if correction fails.
-    pub fn decode_block(&self, msg: &[u8], ecc: &[u8]) -> Option<Vec<u8>> {
-        let mut encoded = Vec::with_capacity(self.msg_length + self.ecc_length);
-        encoded.extend_from_slice(msg);
-        encoded.extend_from_slice(ecc);
-        self.decode(&encoded)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retry_syndromes_match_every_prefix_and_parity_width() {
+        for seed in [0u8, 73, 255] {
+            let original: Vec<_> = (0..255).map(|i| if seed == 73 { (i * 73 + 41) as u8 } else { seed }).collect();
+            let mut retry = RetrySyndromes::new(&original);
+            for length in 0..=255 {
+                let mut changed = original[..length].to_vec();
+                if length > 0 {
+                    for (position, delta) in [(0, 0x13), (length / 2, 0x29), (length - 1, 0x40)] {
+                        changed[position] ^= delta;
+                    }
+                }
+                let expected = calc_syndromes(&changed, length);
+                for ecc in 0..=length {
+                    let prepared = retry.prepare_decode(&changed, length - ecc, ecc);
+                    assert_eq!(prepared.syndromes, expected[..=ecc], "seed {seed}, length {length}, ecc {ecc}");
+                    assert_eq!(prepared.encoded.as_ptr(), changed.as_ptr());
+                }
+            }
+            assert_eq!(retry.prefix_steps, 255 * 255, "each root/prefix is evaluated once");
+            assert_eq!(retry.prefixes.len(), 255);
+            assert_eq!(retry.prefixes.capacity(), 255);
+            assert_eq!(retry.original, original);
+        }
+    }
+
+    #[test]
+    fn retry_syndromes_are_lazy_bounded_and_independent_of_previous_trials() {
+        let original: Vec<_> = (0..255).map(|i| (i * 73 + 41) as u8).collect();
+        let mut retry = RetrySyndromes::new(&original);
+        assert_eq!(retry.prefixes.capacity(), 0);
+        assert_eq!(retry.prefix_steps, 0);
+        for _ in 0..2 {
+            assert_eq!(retry.prepare_decode(&[], 0, 0).syndromes, [0]);
+        }
+        assert_eq!(retry.prefixes.capacity(), 0);
+        let mut changed = original.clone();
+        for mask in 0..64 {
+            changed.copy_from_slice(&original);
+            for position in 0..6 {
+                if mask & (1 << position) != 0 { changed[position * 31] ^= 0x5a; }
+            }
+            for (length, ecc) in [(255, 127), (128, 64), (17, 2)] {
+                let prepared = retry.prepare_decode(&changed[..length], length - ecc, ecc);
+                assert_eq!(prepared.syndromes, calc_syndromes(&changed[..length], ecc));
+            }
+        }
+        assert_eq!(retry.prefix_steps, 255 * 127);
+        assert!(retry.delta_steps <= 64 * 6 * (127 + 64 + 2));
+        assert_eq!(retry.prefixes.capacity(), 127);
+        assert_eq!(retry.original, original);
+        assert_eq!(retry.prepare_decode(&original, 128, 127).syndromes, calc_syndromes(&original, 127),
+            "previous hypotheses never accumulate into the next one");
+    }
+
+    #[test]
+    fn retry_syndromes_preserve_profile_correction_and_erasures() {
+        use crate::protocol::{EccProfile, MAX_LENGTH_VARIABLE};
+        for profile in [EccProfile::Standard, EccProfile::Legacy, EccProfile::Paranoid] {
+            for len in 1..=MAX_LENGTH_VARIABLE {
+                let payload: Vec<_> = (0..len).map(|i| (i * 73 + len * 17) as u8).collect();
+                let protected = profile.protect_payload(&payload);
+                let ecc = profile.ecc_bytes(len);
+                let rs = ReedSolomon::new(protected.len(), ecc);
+                let original = rs.encode(&protected);
+                let mut reference = original.clone();
+                reference.resize(255, 0xa5);
+                let mut retry = RetrySyndromes::new(&reference);
+                for damage in 0..4 {
+                    let mut bytes = original.clone();
+                    let count = match damage { 0 => 0, 1 => ecc / 2, _ => ecc / 2 + 1 };
+                    for i in 0..count { bytes[i] ^= 0x5a; }
+                    let erased: Vec<_> = if damage < 2 { vec![] }
+                        else { (0..count - (damage == 3) as usize).rev().collect() };
+                    let prepared = retry.prepare_decode(&bytes, protected.len(), ecc);
+                    assert_eq!(prepared.decode_with_erasures(&[]), rs.decode(&bytes),
+                        "{profile:?}, length {len}, damage {damage}");
+                    assert_eq!(prepared.decode_with_erasures(&erased), rs.decode_with_erasures(&bytes, &erased),
+                        "{profile:?}, length {len}, damage {damage}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prefix_syndromes_match_every_length_and_parity_width() {
+        let mut state = 0x12ab34cdu32;
+        let random: Vec<u8> = (0..255).map(|_| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state >> 24) as u8
+        }).collect();
+        for bytes in [vec![0; 255], vec![255; 255], (0..255).collect(), random] {
+            let mut prefixes = PrefixDecoder::new(&bytes, 255);
+            for length in 0..=255 {
+                let expected = if length == 0 { vec![0; 256] }
+                    else { calc_syndromes(&bytes[..length], 255) };
+                for ecc in 0..=length {
+                    let prepared = prefixes.prepare_decode(length - ecc, ecc);
+                    assert_eq!(prepared.syndromes, expected[..ecc + 1], "length {length}, ecc {ecc}");
+                    assert_eq!(prepared.encoded, &bytes[..length]);
+                }
+            }
+            // Revisit earlier prefixes after the table has grown fully.
+            for length in (1..=255).rev() {
+                let ecc = length / 2;
+                assert_eq!(prefixes.prepare_decode(length - ecc, ecc).syndromes,
+                    calc_syndromes(&bytes[..length], ecc));
+            }
+            assert_eq!(prefixes.prefix_steps, 255 * 255);
+        }
+    }
+
+    #[test]
+    fn prefix_decoder_is_lazy_bounded_and_reuses_existing_rows() {
+        let bytes: Vec<u8> = (0..255).collect();
+        let mut prefixes = PrefixDecoder::new(&bytes, 127);
+        assert_eq!(prefixes.prefixes.capacity(), 0);
+        let first = prefixes.prepare_decode(64, 64);
+        assert_eq!(first.syndromes, calc_syndromes(&bytes[..128], 64));
+        assert_eq!(prefixes.prefixes.capacity(), 0);
+        assert_eq!(prefixes.prefix_steps, 0);
+        prefixes.prepare_decode(64, 63);
+        assert_eq!(prefixes.prefixes.len(), 63);
+        assert!(prefixes.prefixes.capacity() >= 127);
+        assert_eq!(prefixes.prefix_steps, 63 * bytes.len());
+        let storage = prefixes.prefixes.as_ptr();
+        for length in (64..=255).rev() {
+            prefixes.prepare_decode(length - 63, 63);
+        }
+        assert_eq!(prefixes.prefix_steps, 63 * bytes.len());
+        prefixes.prepare_decode(128, 127);
+        assert_eq!(prefixes.prefix_steps, 127 * bytes.len());
+        assert_eq!(prefixes.prefixes.as_ptr(), storage);
+        // Prepared results own their syndromes and keep the original byte
+        // slice, independently of subsequent table growth and queries.
+        assert_eq!(first.syndromes, calc_syndromes(first.encoded, 64));
+        let mut empty = PrefixDecoder::new(&[], 0);
+        for _ in 0..2 {
+            assert_eq!(empty.prepare_decode(0, 0).decode_with_erasures(&[]), Some(vec![]));
+        }
+        assert_eq!(empty.prefixes.capacity(), 0);
+    }
+
+    #[test]
+    fn prefix_decoding_preserves_profile_error_and_erasure_results() {
+        use crate::protocol::{EccProfile, MAX_LENGTH_VARIABLE};
+        for profile in [EccProfile::Standard, EccProfile::Legacy, EccProfile::Paranoid] {
+            for len in 1..=MAX_LENGTH_VARIABLE {
+                let payload: Vec<u8> = (0..len).map(|i| (i * 73 + len * 17) as u8).collect();
+                let protected = profile.protect_payload(&payload);
+                let ecc = profile.ecc_bytes(len);
+                let rs = ReedSolomon::new(protected.len(), ecc);
+                let original = rs.encode(&protected);
+                for damage in 0..4 {
+                    let mut bytes = original.clone();
+                    let count = match damage { 0 => 0, 1 => ecc / 2, _ => ecc / 2 + 1 };
+                    for i in 0..count { bytes[i] ^= 0x5a; }
+                    let erased: Vec<usize> = if damage < 2 { vec![] }
+                        else { (0..count - (damage == 3) as usize).rev().collect() };
+                    let expected_hard = rs.decode(&bytes);
+                    let expected_soft = rs.decode_with_erasures(&bytes, &erased);
+                    if damage <= 2 {
+                        assert_eq!(expected_soft.as_deref(), Some(protected.as_slice()));
+                    }
+                    // Unrelated trailing observations must not affect this
+                    // prefix. Warm a different length to exercise cached rows.
+                    bytes.resize(255, 0xa5);
+                    let mut prefixes = PrefixDecoder::new(&bytes, ecc);
+                    prefixes.prepare_decode(1, 0);
+                    let prepared = prefixes.prepare_decode(protected.len(), ecc);
+                    assert_eq!(prepared.decode_with_erasures(&[]), expected_hard,
+                        "{profile:?}, length {len}, damage {damage}");
+                    assert_eq!(prepared.decode_with_erasures(&erased), expected_soft,
+                        "{profile:?}, length {len}, damage {damage}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn table_products_match_original_and_polynomial_multiplication_exhaustively() {
+        for x in 0..=255u8 {
+            for y in 0..=255u8 {
+                // Original logarithm/exponent calculation, including zero.
+                let original = if x == 0 || y == 0 {
+                    0
+                } else {
+                    GF_EXP[GF_LOG[x as usize] as usize + GF_LOG[y as usize] as usize]
+                };
+                // Independent carry-less polynomial multiplication modulo
+                // x^8 + x^4 + x^3 + x^2 + 1, without any lookup tables.
+                let mut multiplicand = x as u16;
+                let mut multiplier = y;
+                let mut product = 0u16;
+                for _ in 0..8 {
+                    if multiplier & 1 != 0 { product ^= multiplicand; }
+                    multiplier >>= 1;
+                    multiplicand <<= 1;
+                    if multiplicand & 0x100 != 0 { multiplicand ^= 0x11d; }
+                }
+                assert_eq!(GF_PRODUCTS[x as usize][y as usize], original);
+                assert_eq!(gf_mul(x, y), original);
+                assert_eq!(gf_mul(x, y), product as u8);
+            }
+        }
+    }
+
+    #[test]
+    fn table_syndromes_match_polynomial_evaluation() {
+        assert_eq!(calc_syndromes(&[], 0), [0]);
+        for len in 1..=255 {
+            for pattern in 0..4 {
+                let mut state = len as u32;
+                let message: Vec<u8> = (0..len)
+                    .map(|i| {
+                        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match pattern {
+                            0 => 0,
+                            1 => 255,
+                            2 => (state >> 24) as u8,
+                            _ => {
+                                if i == len / 2 {
+                                    173
+                                } else {
+                                    0
+                                }
+                            }
+                        }
+                    })
+                    .collect();
+                // Include exponent wrapping as well as all profiles' range.
+                for ecc in [0, 1, 2, 4, 8, 16, 56, 124, 255, 256, 257] {
+                    let expected: Vec<u8> = std::iter::once(0)
+                        .chain((0..ecc).map(|i| poly_eval(&message, gf_pow(2, i as isize))))
+                        .collect();
+                    assert_eq!(
+                        calc_syndromes(&message, ecc),
+                        expected,
+                        "length {len}, pattern {pattern}, parity {ecc}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lazy_generator_preserves_encoded_bytes_for_every_parity_width() {
+        use crate::protocol::{EccProfile, MAX_LENGTH_VARIABLE};
+        let mut geometries: Vec<(usize, usize)> = (0..=255).map(|ecc| (255 - ecc, ecc)).collect();
+        for profile in [
+            EccProfile::Standard,
+            EccProfile::Legacy,
+            EccProfile::Paranoid,
+        ] {
+            for len in 1..=MAX_LENGTH_VARIABLE {
+                geometries.push((profile.protected_bytes(len), profile.ecc_bytes(len)));
+            }
+        }
+        for (len, ecc) in geometries {
+            let message: Vec<u8> = (0..len).map(|i| (i * 73 + len * 17) as u8).collect();
+            // Original eager-generator division, independent of encode().
+            let generator = generator_poly(ecc);
+            let mut expected = message.clone();
+            expected.resize(len + ecc, 0);
+            for i in 0..len {
+                let coefficient = expected[i];
+                if coefficient != 0 {
+                    for j in 1..generator.len() {
+                        expected[i + j] ^= gf_mul(generator[j], coefficient);
+                    }
+                }
+            }
+            expected[..len].copy_from_slice(&message);
+
+            let rs = ReedSolomon::new(len, ecc);
+            assert!(rs.generator.get().is_none());
+            assert_eq!(rs.encode(&message), expected);
+            let cached = rs.generator.get().unwrap().as_ptr();
+            assert_eq!(rs.encode(&message), expected);
+            assert_eq!(rs.generator.get().unwrap().as_ptr(), cached);
+            let receiver = ReedSolomon::new(len, ecc);
+            assert_eq!(receiver.decode(&expected), Some(message));
+            assert!(receiver.generator.get().is_none());
+        }
+    }
+
+    #[test]
+    fn correcting_errors_and_erasures_never_builds_an_encoder_generator() {
+        let message: Vec<u8> = (0..120).map(|i| (i * 73 + 41) as u8).collect();
+        let mut encoded = ReedSolomon::new(120, 120).encode(&message);
+        let receiver = ReedSolomon::new(120, 120);
+        for i in 0..60 {
+            encoded[i * 3] ^= 173;
+        }
+        assert_eq!(receiver.decode(&encoded), Some(message.clone()));
+        let erasures: Vec<usize> = (0..120).map(|i| i * 2).collect();
+        encoded = ReedSolomon::new(120, 120).encode(&message);
+        for &pos in &erasures {
+            encoded[pos] ^= 71;
+        }
+        assert_eq!(
+            receiver.decode_with_erasures(&encoded, &erasures),
+            Some(message)
+        );
+        assert!(receiver.generator.get().is_none());
+    }
+
+    // Original allocation-heavy Berlekamp–Massey loop. Retain independent
+    // buffer operations so the in-place swap/scaling/addition can be checked.
+    fn reference_error_locator(synd: &[u8], ecc_length: usize, erase_count: usize) -> Option<Vec<u8>> {
+        let mut err_loc = vec![1u8];
+        let mut old_loc = vec![1u8];
+        let synd_shift = synd.len().saturating_sub(ecc_length);
+        for i in 0..ecc_length - erase_count {
+            let k = i + synd_shift;
+            let mut delta = synd[k];
+            for j in 1..err_loc.len() {
+                delta ^= gf_mul(err_loc[err_loc.len() - j - 1], synd[k - j]);
+            }
+            old_loc.push(0);
+            if delta != 0 {
+                if old_loc.len() > err_loc.len() {
+                    let temp = poly_scale(&old_loc, delta);
+                    old_loc = poly_scale(&err_loc, gf_inverse(delta));
+                    err_loc = temp;
+                }
+                err_loc = poly_add(&err_loc, &poly_scale(&old_loc, delta));
+            }
+        }
+        let shift = err_loc.iter().take_while(|&&coefficient| coefficient == 0).count();
+        let err_loc = err_loc[shift..].to_vec();
+        ((err_loc.len() - 1) * 2 + erase_count <= ecc_length).then_some(err_loc)
+    }
+
+    #[test]
+    fn in_place_locators_match_original_for_every_parity_and_erasure_budget() {
+        for ecc in 0..=255 {
+            for erased in 0..=ecc {
+                for pattern in 0..3 {
+                    let mut random = (ecc * 257 + erased * 73 + 1) as u32;
+                    let synd: Vec<_> = (0..ecc).map(|_| {
+                        random = random.wrapping_mul(1664525).wrapping_add(1013904223);
+                        match pattern {
+                            0 => 0,
+                            1 => 173,
+                            _ => (random >> 24) as u8,
+                        }
+                    }).collect();
+                    assert_eq!(find_error_locator(&synd, ecc, erased),
+                        reference_error_locator(&synd, ecc, erased),
+                        "parity {ecc}, erasures {erased}, pattern {pattern}");
+                }
+            }
+            // Preserve both the raw syndrome's leading sentinel and the
+            // original handling of longer prefixes (synd_shift).
+            for prefix in [1, 3] {
+                for erased in [0, ecc / 2, ecc] {
+                    for position in 0..ecc + prefix {
+                        let mut synd = vec![0; ecc + prefix];
+                        synd[position] = 173;
+                        assert_eq!(find_error_locator(&synd, ecc, erased),
+                            reference_error_locator(&synd, ecc, erased));
+                    }
+                }
+            }
+        }
+    }
+
+    // Original decoder, using polynomial evaluation for its initial and
+    // verification syndromes, to check the prepared-block refactor end to end.
+    fn reference_decode(
+        encoded: &[u8],
+        len: usize,
+        ecc: usize,
+        erasures: &[usize],
+    ) -> Option<Vec<u8>> {
+        let syndromes = |bytes: &[u8]| -> Vec<u8> {
+            std::iter::once(0)
+                .chain((0..ecc).map(|i| poly_eval(bytes, gf_pow(2, i as isize))))
+                .collect()
+        };
+        let synd = syndromes(encoded);
+        if synd.iter().all(|&s| s == 0) {
+            return Some(encoded[..len].to_vec());
+        }
+        if erasures.len() > ecc {
+            return None;
+        }
+        let forney = calc_forney_syndromes(&synd, erasures, encoded.len());
+        let locator = reference_error_locator(&forney, ecc, erasures.len())?;
+        let reversed: Vec<u8> = locator.iter().rev().copied().collect();
+        let errors = find_errors(&reversed, encoded.len())?;
+        let mut positions = erasures.to_vec();
+        positions.extend_from_slice(&errors);
+        if positions.is_empty() {
+            return None;
+        }
+        let corrected = correct_errata(encoded, &synd, &positions);
+        syndromes(&corrected)
+            .iter()
+            .all(|&s| s == 0)
+            .then(|| corrected[..len].to_vec())
+    }
+
+    #[test]
+    fn prepared_retries_preserve_reference_results_at_all_profile_lengths() {
+        use crate::protocol::{EccProfile, MAX_LENGTH_VARIABLE};
+        for profile in [
+            EccProfile::Standard,
+            EccProfile::Legacy,
+            EccProfile::Paranoid,
+        ] {
+            for payload_len in 1..=MAX_LENGTH_VARIABLE {
+                let len = profile.protected_bytes(payload_len);
+                let ecc = profile.ecc_bytes(payload_len);
+                let message: Vec<u8> = (0..len).map(|i| (i * 73 + len * 17) as u8).collect();
+                let rs = ReedSolomon::new(len, ecc);
+                let codeword = rs.encode(&message);
+                for damage in [0, ecc / 2, ecc, ecc + 1] {
+                    let positions: Vec<usize> = (0..damage)
+                        .map(|i| (i + len / 2) % codeword.len())
+                        .collect();
+                    let mut received = codeword.clone();
+                    for &pos in &positions {
+                        received[pos] ^= 173;
+                    }
+                    let prepared = rs.prepare_decode(&received);
+                    let original_syndromes = prepared.syndromes.clone();
+                    let hard = reference_decode(&received, len, ecc, &[]);
+                    assert_eq!(prepared.decode_with_erasures(&[]), hard);
+                    let expected = reference_decode(&received, len, ecc, &positions);
+                    assert_eq!(prepared.decode_with_erasures(&positions), expected);
+                    if damage <= ecc {
+                        assert_eq!(expected, Some(message.clone()));
+                    }
+                    if damage <= ecc / 2 {
+                        assert_eq!(hard, Some(message.clone()));
+                    }
+                    // An erasure retry cannot mutate the hard-decision input.
+                    assert_eq!(prepared.decode_with_erasures(&[]), hard);
+                    assert_eq!(prepared.syndromes, original_syndromes);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_gf_mul_basic() {
@@ -585,7 +1215,10 @@ mod tests {
         }
 
         let result = rs.decode_with_erasures(&corrupted, &[0, 1, 2, 3, 4]);
-        assert!(result.is_none(), "should fail when erasures exceed ECC budget");
+        assert!(
+            result.is_none(),
+            "should fail when erasures exceed ECC budget"
+        );
     }
 
     #[test]
@@ -604,7 +1237,10 @@ mod tests {
         corrupted[7] ^= 0xBE;
 
         // Hard-decision fails
-        assert!(rs.decode(&corrupted).is_none(), "hard-decision should fail with 3 errors and ecc=4");
+        assert!(
+            rs.decode(&corrupted).is_none(),
+            "hard-decision should fail with 3 errors and ecc=4"
+        );
 
         // Erasure-aided succeeds (3 erasures cost 3, within budget of 4)
         let decoded = rs.decode_with_erasures(&corrupted, &[2, 5, 7]).unwrap();

@@ -1,9 +1,10 @@
 // AKT — one screen, two explicit roles, one verified result.
 // The sender loops acoustic copies until stopped. The receiver keeps merging
 // incomplete copies and only returns CRC-verified bytes.
-import init, { transfer_encode, crc32, max_transfer_payload, WasmTransferRx } from '../pkg/song_rs_wasm.js';
+import init, { transfer_encode, crc32, max_transfer_payload } from '../pkg/song_rs_wasm.js';
 import { crcHex, crcWords } from './fingerprint.js';
 import { AudioEngine } from './audio.js';
+import { ReceiverWorker } from './receiver.js';
 
 const $ = (id) => document.getElementById(id);
 const enc = new TextEncoder();
@@ -258,6 +259,12 @@ function renderMicRequesting() {
 
 function micFailureCopy(err) {
   switch (err?.name) {
+    case 'DecoderWorkerError':
+      return {
+        status: 'Decoder unavailable',
+        line: 'Reception stopped',
+        tip: err.message || 'Background decoding could not start. Retry reception.',
+      };
     case 'NotAllowedError':
     case 'SecurityError':
       return {
@@ -331,15 +338,33 @@ function restoreReceiver() {
 
 function freshReceiver() {
   if (S.rx) {
-    try { S.rx.free(); } catch (_) { /* already freed */ }
+    S.rx.reset();
+  } else {
+    S.rx = new ReceiverWorker({
+      onDecoded: (bytes) => {
+        if (S.mic === 'on' && !S.playing) onDecoded(bytes);
+        else bytes.fill(0);
+      },
+      onError: receiverFailed,
+    });
   }
-  S.rx = new WasmTransferRx();
   S.attempts = 0;
   S.mergeLine = null;
   S.mergeSetAt = 0;
   S.prevAttemptAt = -Infinity;
   S.copyEstMs = 0;
   S.lastLockedAt = -Infinity;
+  return S.rx.ready;
+}
+
+function receiverFailed(error) {
+  S.rx?.free();
+  S.rx = null;
+  engine.stopRx();
+  S.mic = 'denied';
+  S.micError = error;
+  S.suspended = false;
+  restoreReceiver();
 }
 
 async function requestMic() {
@@ -347,17 +372,24 @@ async function requestMic() {
   S.mic = 'requesting';
   S.micError = null;
   renderMicRequesting();
+  let receiver;
   try {
+    // Resume within the microphone button's user gesture, before waiting for
+    // worker startup/network loading can consume the browser's activation.
+    engine.ensureCtx().resume().catch(() => {});
+    const ready = freshReceiver();
+    receiver = S.rx;
+    await ready;
+    if (S.rx !== receiver) return;
     await engine.startRx({ onChunk: handleChunk });
   } catch (err) {
+    if (receiver && S.rx !== receiver) return; // an older request was cancelled
     console.error(err);
-    S.mic = 'denied';
-    S.micError = err;
-    renderMicDenied(err);
+    receiverFailed(err);
     return;
   }
+  if (S.rx !== receiver) return;
   S.mic = 'on';
-  freshReceiver();
   engine.ctx.onstatechange = syncSuspended;
   syncSuspended();
   resumeOnGesture();
@@ -392,8 +424,7 @@ function resumeOnGesture() {
 
 function handleChunk(chunk) {
   if (S.playing || !S.rx) return;
-  const result = S.rx.ingest(chunk);
-  if (result) onDecoded(result);
+  S.rx.ingest(chunk);
 }
 
 function updateMeter(fill, zone, attempting) {
@@ -435,14 +466,12 @@ function onDecoded(bytes) {
   // sender is still looping (or a second sender starts nearby).
   if (S.decoded !== null) {
     if (typeof bytes.fill === 'function') bytes.fill(0);
-    freshReceiver();
     return;
   }
   S.decodedBytes = bytes;
   S.decoded = dec.decode(bytes);
   S.okCopies = S.rx.attempts() + 1;
   S.okFp = makeFingerprint(bytes);
-  freshReceiver();
   renderResult(true);
 }
 
@@ -485,6 +514,9 @@ function renderResult(announce = false) {
 }
 
 function clearResult() {
+  // A user's clear is a session boundary. Discard queued/in-flight results
+  // from before this action so they cannot immediately restore the old value.
+  if (S.rx) freshReceiver();
   if (S.decodedBytes) S.decodedBytes.fill(0);
   S.decoded = null;
   S.decodedBytes = null;
@@ -542,7 +574,9 @@ function frame() {
       tips = QUIET_TIP;
     }
 
-    if (hearing) {
+    if (S.rx.backlogSeconds > 1) {
+      setLine('Processing captured audio…', 'Reception continues while the decoder catches up.');
+    } else if (hearing) {
       setLine('Signal detected. Receiving copy…', tips ?? 'Maintain device position.', quiet && tips !== null);
     } else if (S.mergeLine) {
       setLine(S.mergeLine, tips ?? 'Copies are combined automatically.', quiet && tips !== null);

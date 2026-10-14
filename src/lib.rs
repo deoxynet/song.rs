@@ -3,8 +3,10 @@
 //! Encode byte payloads to 48 kHz f32 audio using vowel identity (F2 formant)
 //! as the sole data channel and decode f32 audio back to bytes.
 //! Teams branch: 4 vowels = 2 bits per symbol. Pitch carries no data — the
-//! encoder plays a D lydian arpeggio (protocol::MELODY) and detection is
-//! F0-agnostic, so pitch distortion can never corrupt data.
+//! encoder sings Giant Steps by default and detection does not require
+//! the receiver to know the melody.
+//! Default message frames include CRC-32 inside the RS-protected block.
+//! Older checksum-free recordings require [`protocol::EccProfile::Legacy`].
 //!
 //! # Example
 //!
@@ -16,6 +18,8 @@
 //! ```
 
 pub mod protocol;
+mod audio;
+mod checksum;
 pub mod reed_solomon;
 pub mod rs4;
 pub mod rs3;
@@ -31,7 +35,7 @@ pub mod transfer;
 pub use decoder::Decoder;
 pub use encoder::encode_with_pitch;
 pub use phy::{Phy, PhyConfig, PhyEvent, PhyError};
-pub use stream::{StreamTx, StreamRx, StreamConfig};
+pub use stream::{StreamTx, StreamRx, StreamConfig, StreamProfile};
 
 /// Encode a payload into f32 audio samples using the 2-channel vocal modem.
 ///
@@ -43,12 +47,15 @@ pub use stream::{StreamTx, StreamRx, StreamConfig};
 /// The payload sings the default melody — the head of Giant Steps
 /// (pitch carries no data). For maximum channel margin on worst-case
 /// links, use [`encode_armored`].
+/// The default format includes CRC-32; both peers must use this format.
+/// For old peers, select [`protocol::EccProfile::Legacy`] explicitly via
+/// [`encoder::encode_with_profile`].
 pub fn encode(payload: &[u8], volume: u8) -> Result<Vec<f32>, Error> {
     encoder::encode(payload, volume)
 }
 
-/// Encode with the margin-verified arpeggio melody throughout — maximum
-/// channel robustness (the default for the secret-transfer profile).
+/// Encode with the margin-verified arpeggio for the payload (also used by
+/// the secret-transfer profile). Intro and outro sing The Lick.
 pub fn encode_armored(payload: &[u8], volume: u8) -> Result<Vec<f32>, Error> {
     encoder::encode_armored(payload, volume)
 }
@@ -70,6 +77,9 @@ pub enum Error {
 
     #[error("pitch track length {got} does not match payload length {expected}")]
     PitchTrackMismatch { got: usize, expected: usize },
+
+    #[error("invalid pitch at byte {index}: {hz} Hz (must be finite and positive)")]
+    InvalidPitch { index: usize, hz: f64 },
 }
 
 #[cfg(test)]
@@ -131,8 +141,7 @@ mod tests {
         let audio = encode(payload, 25).unwrap();
 
         let data_length = payload.len();
-        let n_ecc = protocol::ecc_bytes_for_length(data_length);
-        let total_bytes = protocol::ENCODED_DATA_OFFSET + data_length + n_ecc;
+        let total_bytes = protocol::EccProfile::Standard.encoded_bytes(data_length);
         let n_data_symbols = formant::symbols_for_bytes(total_bytes);
         let total_symbols = protocol::PREAMBLE_LEN
             + protocol::PILOT_LEN
@@ -602,8 +611,7 @@ mod tests {
             let payload: Vec<u8> = (0..size).map(|i| (i % 256) as u8).collect();
             let audio = encode(&payload, 50).unwrap();
 
-            let n_ecc = protocol::ecc_bytes_for_length(size);
-            let total_bytes = protocol::ENCODED_DATA_OFFSET + size + n_ecc;
+            let total_bytes = protocol::EccProfile::Standard.encoded_bytes(size);
             let n_data_symbols = formant::symbols_for_bytes(total_bytes);
             let total_symbols = protocol::PREAMBLE_LEN
                 + protocol::PILOT_LEN

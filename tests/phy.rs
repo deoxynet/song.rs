@@ -156,7 +156,7 @@ fn phone_channel(samples: &[f32]) -> Vec<f32> {
 }
 
 fn bandpass(samples: &[f32], lo: f64, hi: f64) -> Vec<f32> {
-    let sr = 48000.0;
+    let sr = SAMPLE_RATE;
     let center = (lo * hi).sqrt();
     let bw = hi - lo;
     let q = center / bw;
@@ -222,6 +222,38 @@ fn test_single_message() {
 }
 
 #[test]
+fn test_nonfinite_capture_samples_preserve_data_and_ack_timing() {
+    let mut a = Phy::new(PhyConfig::default());
+    let mut b = Phy::new(PhyConfig::default());
+    let idle = vec![f32::NAN; 5 * song_rs::protocol::SYMBOL_TOTAL_SAMPLES];
+    a.ingest(&idle);
+    b.ingest(&idle);
+    assert!(a.poll().is_none() && b.poll().is_none());
+    let channel = || {
+        let mut index = 0;
+        move |samples: &[f32]| {
+            let mut out = samples.to_vec();
+            out[CHUNK / 2] = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY][index % 3];
+            index += 1;
+            out
+        }
+    };
+    let message = b"data and ack survive invalid input";
+    a.send(message).unwrap();
+    let (a_events, b_events) = run_loopback_channels(
+        &mut a, &mut b, &mut channel(), &mut channel(), 30_000,
+    );
+    assert_eq!(a_events.iter().filter(|event| matches!(event, PhyEvent::SendComplete)).count(), 1);
+    assert!(!has_event(&a_events, |event| matches!(event, PhyEvent::SendFailed)));
+    let deliveries: Vec<_> = b_events.iter().filter_map(|event| match event {
+        PhyEvent::Received(bytes) => Some(bytes.as_slice()),
+        _ => None,
+    }).collect();
+    assert_eq!(deliveries, vec![message.as_slice()]);
+    assert!(a.is_idle() && b.is_idle());
+}
+
+#[test]
 fn test_single_byte() {
     let mut a = Phy::new(PhyConfig::default());
     let mut b = Phy::new(PhyConfig::default());
@@ -232,6 +264,46 @@ fn test_single_byte() {
 
     assert!(has_event(&a_ev, |e| matches!(e, PhyEvent::SendComplete)));
     assert_eq!(get_received(&b_ev).unwrap().as_slice(), &[0x42]);
+}
+
+#[test]
+fn test_default_ack_timeout_allows_channel_latency() {
+    // CRC-protected ACKs take 3.84 s on air. Allow 250 ms one-way
+    // channel latency without forcing an otherwise unnecessary retransmit.
+    let delayed_channel = || {
+        let mut delay = std::collections::VecDeque::from(vec![
+            0.0f32;
+            SAMPLE_RATE as usize / 4
+        ]);
+        move |samples: &[f32]| -> Vec<f32> {
+            samples.iter()
+                .map(|&sample| {
+                    delay.push_back(sample);
+                    delay.pop_front().unwrap()
+                })
+                .collect()
+        }
+    };
+    let mut a = Phy::new(PhyConfig {
+        max_retries: 0,
+        ..PhyConfig::default()
+    });
+    let mut b = Phy::new(PhyConfig::default());
+    let message = b"delayed ACK";
+    a.send(message).unwrap();
+    let (a_ev, b_ev) = run_loopback_channels(
+        &mut a,
+        &mut b,
+        &mut delayed_channel(),
+        &mut delayed_channel(),
+        30_000,
+    );
+    assert_eq!(get_received(&b_ev).unwrap().as_slice(), message);
+    assert!(
+        has_event(&a_ev, |e| matches!(e, PhyEvent::SendComplete)),
+        "ACK should arrive before the default timeout: {a_ev:?}"
+    );
+    assert!(!has_event(&a_ev, |e| matches!(e, PhyEvent::SendFailed)));
 }
 
 #[test]
@@ -342,12 +414,7 @@ fn test_lost_ack() {
 }
 
 /// Test data frame retransmission after packet loss.
-///
-/// NOTE: At 8kHz, the frame boundary detection in FrameDropChannel is less
-/// reliable due to shorter symbol periods (400 samples vs 2400 at 48kHz) and
-/// guard periods (80 samples < 128 sample chunk). Skip at 8kHz.
 #[test]
-#[cfg_attr(feature = "8khz", ignore = "frame detection unreliable at 8kHz chunk boundaries")]
 fn test_lost_data() {
     let mut a = Phy::new(PhyConfig {
         timeout_ms: 4000,
@@ -370,6 +437,7 @@ fn test_lost_data() {
         60_000,
     );
 
+    assert!(chan_a_to_b.frame_count >= 2, "the dropped DATA must be retransmitted");
     assert!(has_event(&a_ev, |e| matches!(e, PhyEvent::SendComplete)));
     assert_eq!(get_received(&b_ev).unwrap().as_slice(), message);
 }

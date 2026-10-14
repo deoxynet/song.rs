@@ -35,8 +35,9 @@ pub fn max_transfer_payload() -> usize {
     song_rs::transfer::MAX_TRANSFER_PAYLOAD
 }
 
-/// Streaming receiver. Feed capture chunks to `ingest`; returns the verified
-/// payload bytes once, then null forever after.
+/// Streaming receiver. Feed capture chunks to `ingest`; each verified
+/// reception can return payload bytes. Applications can latch the first
+/// result if they do not want repeated transmissions delivered again.
 #[wasm_bindgen]
 pub struct WasmTransferRx {
     inner: song_rs::transfer::TransferRx,
@@ -52,7 +53,8 @@ impl WasmTransferRx {
     }
 
     /// Ingest a chunk of 48 kHz mono f32 samples.
-    /// Returns the verified payload (`Uint8Array`) exactly once, else null.
+    /// Returns a verified payload (`Uint8Array`) when available, else null.
+    /// Receiving continues after delivery, with old combining votes retired.
     pub fn ingest(&mut self, chunk: &[f32]) -> Option<Vec<u8>> {
         self.inner.ingest(chunk)
     }
